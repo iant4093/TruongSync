@@ -77,12 +77,24 @@ export const App: React.FC = () => {
 
         <div className={`workspace-body ${inspectorOpen ? 'with-inspector' : ''}`}>
           <div className="content-viewport">
-            {activeNav === 'import' && <ImportView />}
-            {activeNav === 'geotag' && <GeotagView />}
-            {activeNav === 'cloud' && <CloudSyncView />}
-            {activeNav === 'backup' && <DriveBackupView />}
-            {activeNav === 'activity' && <ActivityView />}
-            {activeNav === 'settings' && <SettingsView />}
+            <div style={{ display: activeNav === 'import' ? undefined : 'none' }}>
+              <ImportView />
+            </div>
+            <div style={{ display: activeNav === 'geotag' ? undefined : 'none' }}>
+              <GeotagView />
+            </div>
+            <div style={{ display: activeNav === 'cloud' ? undefined : 'none' }}>
+              <CloudSyncView />
+            </div>
+            <div style={{ display: activeNav === 'backup' ? undefined : 'none' }}>
+              <DriveBackupView />
+            </div>
+            <div style={{ display: activeNav === 'activity' ? undefined : 'none' }}>
+              <ActivityView />
+            </div>
+            <div style={{ display: activeNav === 'settings' ? undefined : 'none' }}>
+              <SettingsView />
+            </div>
           </div>
           <JobInspectorDrawer />
         </div>

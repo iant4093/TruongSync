@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { FolderOpen, MapPin, Play, Sparkles } from 'lucide-react';
 import { api, pickDirectory, pickFiles } from '../../lib/tauri';
-import { confirmAction, notifyError, notifySuccess } from '../../store/feedback';
+import { confirmAction, notifyError, notifyInfo, notifySuccess } from '../../store/feedback';
 import { useSyncStore } from '../../store/useSyncStore';
 import type { GeotagExecutionResult, GeotagPlan, WatchedGpxMatch } from '../../types/api';
 import { GpxMapPreview } from '../GpxMapPreview';
@@ -124,7 +124,11 @@ export const GeotagView: React.FC = () => {
         setPlan(null);
         setPreviewSignature(null);
       }
-      if (res.failed_count > 0) {
+      if (res.cancelled) {
+        notifyInfo(
+          `Geotagging cancelled after tagging ${res.tagged_count} photo(s).`,
+        );
+      } else if (res.failed_count > 0) {
         notifyError(
           `Geotagging finished with ${res.failed_count} failure(s) (${res.tagged_count} photo(s) tagged).`,
         );
@@ -310,10 +314,19 @@ export const GeotagView: React.FC = () => {
       </div>
 
       {result && (
-        <div className={result.failed_count > 0 ? 'error-banner' : 'ok-banner'} style={{ marginTop: 14 }}>
+        <div
+          className={
+            result.failed_count > 0
+              ? 'error-banner'
+              : result.cancelled
+                ? 'offline-notice'
+                : 'ok-banner'
+          }
+          style={{ marginTop: 14 }}
+        >
           <strong>
-            Geotagging complete: {result.tagged_count} photos tagged, {result.skipped_count} skipped,{' '}
-            {result.failed_count} failed.
+            {result.cancelled ? 'Geotagging cancelled' : 'Geotagging complete'}: {result.tagged_count}{' '}
+            photos tagged, {result.skipped_count} skipped, {result.failed_count} failed.
           </strong>
           {recordBackfill && result.tagged_count > 0 && (
             <div style={{ marginTop: 4 }}>

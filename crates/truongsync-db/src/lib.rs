@@ -228,6 +228,7 @@ impl DbHandle {
         if preset.is_default {
             tx.execute("UPDATE import_presets SET is_default = 0", [])?;
         }
+        let now = Utc::now().to_rfc3339();
         tx.execute(
             "INSERT INTO import_presets (
                 id, name, root_path, folder_template, date_format, raw_folder, jpeg_folder, video_folder,
@@ -257,9 +258,39 @@ impl DbHandle {
                 preset.auto_external_sync as i64,
                 preset.eject_after as i64,
                 preset.is_default as i64,
-                Utc::now().to_rfc3339(),
+                now,
             ],
         )?;
+        // Keep `app_settings` aligned when the built-in default preset is edited directly
+        // so subsequent `save_settings` / auto-launch toggles never revert preset edits.
+        if id == "default-photo-dump" {
+            let mut settings: AppSettings = tx
+                .query_row(
+                    "SELECT value_json FROM settings WHERE key = 'app_settings'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
+            settings.default_import_root = preset.root_path.clone();
+            settings.folder_template = preset.folder_template.clone();
+            settings.date_format = preset.date_format.clone();
+            settings.raw_folder_name = preset.raw_folder.clone();
+            settings.jpeg_folder_name = preset.jpeg_folder.clone();
+            settings.video_folder_name = preset.video_folder.clone();
+            if !preset.default_categories.is_empty() {
+                settings.default_categories = preset.default_categories.clone();
+            }
+            settings.transfer_mode = preset.transfer_mode.clone();
+            settings.eject_after_move = preset.eject_after;
+            let json = serde_json::to_string(&settings)?;
+            tx.execute(
+                "INSERT INTO settings (key, value_json, updated_at) VALUES ('app_settings', ?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at",
+                params![json, now],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }

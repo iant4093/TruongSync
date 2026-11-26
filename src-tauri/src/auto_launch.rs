@@ -299,13 +299,11 @@ pub fn check_new_sd_card_for_launch_agent() -> Option<String> {
     );
     let _ = paths.ensure_dirs();
     // Open SQLite strictly read-only so `--check-mounts` NEVER mutates or marks active GUI jobs interrupted!
-    if let Ok(db) = truongsync_db::DbHandle::open_readonly(&paths.db_path) {
-        if let Ok(settings) = db.load_settings() {
-            if !settings.auto_open_on_sd_insert {
-                return None;
-            }
-        }
-    }
+    let auto_open_enabled = truongsync_db::DbHandle::open_readonly(&paths.db_path)
+        .ok()
+        .and_then(|db| db.load_settings().ok())
+        .map(|s| s.auto_open_on_sd_insert)
+        .unwrap_or(true);
 
     let seen_file = seen_mounts_file();
     let prev: HashSet<String> = std::fs::read_to_string(&seen_file)
@@ -320,10 +318,16 @@ pub fn check_new_sd_card_for_launch_agent() -> Option<String> {
         .map(|v| (format!("{}|{}", v.mount_path, v.volume_uuid), v.mount_path))
         .collect();
     let current_set: HashSet<String> = current_dcim.iter().map(|(k, _)| k.clone()).collect();
+    // Always sync `seen_mounts_file` even when auto-open is temporarily disabled, so re-enabling
+    // auto-open never triggers a spurious launch for an already-mounted card.
     let _ = std::fs::write(
         &seen_file,
         serde_json::to_string(&current_set).unwrap_or_default(),
     );
+
+    if !auto_open_enabled {
+        return None;
+    }
 
     current_dcim
         .into_iter()

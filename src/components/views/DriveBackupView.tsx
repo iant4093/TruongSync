@@ -46,8 +46,14 @@ export const DriveBackupView: React.FC = () => {
   const refreshJobs = useSyncStore((s) => s.refreshJobs);
 
   const [editing, setEditing] = useState<ExternalProfile | null>(null);
+  const [staleDaysText, setStaleDaysText] = useState('14');
   const [busyMap, setBusyMap] = useState<Record<string, 'verify' | 'sync'>>({});
   const [reports, setReports] = useState<Record<string, ExternalVerifyReport>>({});
+
+  const openEditor = (profile: ExternalProfile) => {
+    setEditing(profile);
+    setStaleDaysText(String(profile.stale_after_days || 14));
+  };
 
   const setProfileBusy = (id: string, kind: 'verify' | 'sync' | null) => {
     setBusyMap((prev) => {
@@ -87,11 +93,20 @@ export const DriveBackupView: React.FC = () => {
       }
     }
     try {
+      const parsedDays = Math.max(1, Math.trunc(Number(staleDaysText.trim()) || 14));
+      const savedId = editing.id;
       await api.saveExternalProfile({
         ...editing,
         schedule_value: editing.schedule_value.trim(),
-        stale_after_days: Math.max(1, editing.stale_after_days || 14),
+        stale_after_days: parsedDays,
       });
+      if (savedId) {
+        setReports((prev) => {
+          const next = { ...prev };
+          delete next[savedId];
+          return next;
+        });
+      }
       notifySuccess(`Saved external backup profile "${editing.name}".`);
       setEditing(null);
       await refreshProfiles();
@@ -189,7 +204,7 @@ export const DriveBackupView: React.FC = () => {
               className="button button-primary"
               onClick={() => {
                 const firstExt = volumes.find((v) => !v.has_dcim);
-                setEditing({
+                openEditor({
                   ...BLANK_EXTERNAL,
                   volume_uuid: firstExt?.volume_uuid ?? '',
                   volume_label: firstExt?.label ?? '',
@@ -346,17 +361,11 @@ export const DriveBackupView: React.FC = () => {
               <div className="settings-field" style={{ marginBottom: 0 }}>
                 <span>Freshness Warning (Days)</span>
                 <input
-                  type="number"
+                  type="text"
+                  inputMode="numeric"
                   className="text-input"
-                  min={1}
-                  step={1}
-                  value={editing.stale_after_days}
-                  onChange={(e) =>
-                    setEditing({
-                      ...editing,
-                      stale_after_days: Math.max(1, Math.trunc(Number(e.target.value) || 14)),
-                    })
-                  }
+                  value={staleDaysText}
+                  onChange={(e) => setStaleDaysText(e.target.value)}
                 />
               </div>
             </div>
@@ -413,7 +422,7 @@ export const DriveBackupView: React.FC = () => {
             <button
               type="button"
               className="button button-primary"
-              onClick={() => setEditing({ ...BLANK_EXTERNAL })}
+              onClick={() => openEditor({ ...BLANK_EXTERNAL })}
             >
               <Plus size={14} /> Add Backup Drive
             </button>
@@ -492,7 +501,7 @@ export const DriveBackupView: React.FC = () => {
                       type="button"
                       className="button button-quiet"
                       disabled={isBusy}
-                      onClick={() => setEditing(p)}
+                      onClick={() => openEditor(p)}
                     >
                       Edit
                     </button>

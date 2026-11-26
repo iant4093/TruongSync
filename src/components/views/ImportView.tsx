@@ -13,7 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import { api, formatBytes, formatDurationMs, pickDirectory, pickFiles } from '../../lib/tauri';
-import { notifyError, notifySuccess } from '../../store/feedback';
+import { notifyError, notifyInfo, notifySuccess } from '../../store/feedback';
 import { useSyncStore } from '../../store/useSyncStore';
 import type {
   CardScanResult,
@@ -106,7 +106,9 @@ export const ImportView: React.FC = () => {
   const externalProfiles = useSyncStore((s) => s.externalProfiles);
   const activeJobs = useSyncStore((s) => s.activeJobs);
   const importProgress =
-    Object.values(activeJobs).find((j) => j.stage === 'import' || j.stage === 'geotag') ?? null;
+    Object.values(activeJobs).find(
+      (j) => j.job_kind === 'pipeline' || (!j.job_kind && j.stage === 'import'),
+    ) ?? null;
   const pendingAutoImportPath = useSyncStore((s) => s.pendingAutoImportPath);
   const setPendingAutoImportPath = useSyncStore((s) => s.setPendingAutoImportPath);
   const refreshVolumes = useSyncStore((s) => s.refreshVolumes);
@@ -273,8 +275,11 @@ export const ImportView: React.FC = () => {
     setPlanPreview(null);
   }, [destRoot, folderTemplate, dateFormat, rawFolder, jpegFolder, videoFolder, splitByDate, shootName, category, folderDate, dateAssignments]);
 
-  const handleScanSource = async (path: string, opts?: { preserveSummary?: boolean }) => {
-    if (running) return;
+  const handleScanSource = async (
+    path: string,
+    opts?: { preserveSummary?: boolean; force?: boolean },
+  ) => {
+    if (running && !opts?.force) return;
     const seq = ++scanSeqRef.current;
     setSourceRoot(path);
     setScan(null);
@@ -479,7 +484,11 @@ export const ImportView: React.FC = () => {
       });
       setLastSummary(summary);
       const stageErrs = summary.stage_errors ?? 0;
-      if (summary.import.files_failed === 0 && stageErrs === 0) {
+      if (summary.cancelled) {
+        notifyInfo(
+          `Import cancelled (${summary.import.files_moved} transferred before cancellation).`,
+        );
+      } else if (summary.import.files_failed === 0 && stageErrs === 0) {
         notifySuccess(
           `Imported ${summary.import.files_moved} files in ${formatDurationMs(summary.import.duration_ms)}`,
         );
@@ -494,8 +503,13 @@ export const ImportView: React.FC = () => {
       }
       await refreshVolumes();
       await refreshJobs();
-      if (transferMode === 'move' && !summary.ejected) {
-        await handleScanSource(sourceRoot, { preserveSummary: true });
+      if (summary.ejected) {
+        setScan(null);
+        setSourceRoot('');
+        setPreflight(null);
+        setPlanPreview(null);
+      } else if (transferMode === 'move') {
+        await handleScanSource(sourceRoot, { preserveSummary: true, force: true });
       }
     } catch (err) {
       notifyError(err, 'Import failed');
@@ -1076,29 +1090,6 @@ export const ImportView: React.FC = () => {
             </div>
           )}
 
-          {/* Last Run Summary */}
-          {lastSummary && (
-            <div
-              className={
-                lastSummary.import.files_failed > 0 || (lastSummary.stage_errors ?? 0) > 0
-                  ? 'error-banner'
-                  : 'ok-banner'
-              }
-              style={{ marginTop: 14 }}
-            >
-              <strong>
-                Import finished: {lastSummary.import.files_moved} transferred, {lastSummary.import.files_skipped} skipped,{' '}
-                {lastSummary.import.files_failed} failed ({formatBytes(lastSummary.import.bytes_transferred)} in{' '}
-                {formatDurationMs(lastSummary.import.duration_ms)})
-              </strong>
-              {lastSummary.notes.map((n, i) => (
-                <div key={i} style={{ marginTop: 4 }}>
-                  • {n}
-                </div>
-              ))}
-            </div>
-          )}
-
           {/* Action Bar */}
           <div className="row-between" style={{ marginTop: 18 }}>
             <button type="button" className="button" disabled={running || totalCount === 0} onClick={() => void handlePreviewPlan()}>
@@ -1153,6 +1144,35 @@ export const ImportView: React.FC = () => {
             </div>
           )}
         </>
+      )}
+
+      {/* Last Run Summary (rendered outside scan block so it stays visible even after auto-eject clears the card) */}
+      {lastSummary && (
+        <div
+          className={
+            lastSummary.import.files_failed > 0 || (lastSummary.stage_errors ?? 0) > 0
+              ? 'error-banner'
+              : lastSummary.cancelled
+                ? 'offline-notice'
+                : 'ok-banner'
+          }
+          style={{ marginTop: 14 }}
+        >
+          <div>
+            <strong>
+              {lastSummary.cancelled ? 'Import cancelled' : 'Import finished'}:{' '}
+              {lastSummary.import.files_moved} transferred, {lastSummary.import.files_skipped}{' '}
+              skipped, {lastSummary.import.files_failed} failed (
+              {formatBytes(lastSummary.import.bytes_transferred)} in{' '}
+              {formatDurationMs(lastSummary.import.duration_ms)})
+            </strong>
+            {lastSummary.notes.map((n, i) => (
+              <div key={i} style={{ marginTop: 4 }}>
+                • {n}
+              </div>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );

@@ -5212,6 +5212,7 @@ dependencies = [
  "truongsync-db",
  "truongsync-ingest",
  "walkdir",
+ "windows",
 ]
 
 [[package]]

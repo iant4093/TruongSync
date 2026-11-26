@@ -45,6 +45,7 @@ export const CloudSyncView: React.FC = () => {
   const refreshJobs = useSyncStore((s) => s.refreshJobs);
 
   const [editing, setEditing] = useState<CloudProfile | null>(null);
+  const [staleDaysText, setStaleDaysText] = useState('7');
   const [oauthOpen, setOauthOpen] = useState(false);
   const [oauthRemote, setOauthRemote] = useState('rawphotos');
   const [oauthClientId, setOauthClientId] = useState('');
@@ -52,6 +53,11 @@ export const CloudSyncView: React.FC = () => {
   const [oauthBusy, setOauthBusy] = useState(false);
   const [busyMap, setBusyMap] = useState<Record<string, 'verify' | 'sync'>>({});
   const [verifyReports, setVerifyReports] = useState<Record<string, CloudVerifyReport>>({});
+
+  const openEditor = (profile: CloudProfile) => {
+    setEditing(profile);
+    setStaleDaysText(String(profile.stale_after_days || 7));
+  };
 
   const setProfileBusy = (id: string, kind: 'verify' | 'sync' | null) => {
     setBusyMap((prev) => {
@@ -110,11 +116,20 @@ export const CloudSyncView: React.FC = () => {
       }
     }
     try {
+      const parsedDays = Math.max(1, Math.trunc(Number(staleDaysText.trim()) || 7));
+      const savedId = editing.id;
       await api.saveCloudProfile({
         ...editing,
         schedule_value: editing.schedule_value.trim(),
-        stale_after_days: Math.max(1, Math.trunc(Number(editing.stale_after_days) || 7)),
+        stale_after_days: parsedDays,
       });
+      if (savedId) {
+        setVerifyReports((prev) => {
+          const next = { ...prev };
+          delete next[savedId];
+          return next;
+        });
+      }
       notifySuccess(`Saved cloud profile "${editing.name}".`);
       setEditing(null);
       await refreshProfiles();
@@ -207,14 +222,18 @@ export const CloudSyncView: React.FC = () => {
             <button type="button" className="button" onClick={() => void handleImportConf()}>
               <FolderOpen size={14} /> Import rclone.conf
             </button>
-            <button type="button" className="button" onClick={() => setOauthOpen((v) => !v)}>
+            <button
+              type="button"
+              className="button"
+              onClick={() => setOauthOpen((v) => (oauthBusy ? true : !v))}
+            >
               <Link2 size={14} /> Connect Google Drive
             </button>
             <button
               type="button"
               className="button button-primary"
               onClick={() =>
-                setEditing({
+                openEditor({
                   ...BLANK_PROFILE,
                   remote_name: tools?.rclone_remotes[0] ?? 'rawphotos',
                 })
@@ -291,7 +310,7 @@ export const CloudSyncView: React.FC = () => {
                   <button
                     type="button"
                     className="button button-danger"
-                    onClick={() => void api.cancelActiveJob()}
+                    onClick={() => void api.cancelOAuth()}
                   >
                     Cancel Sign-In
                   </button>
@@ -406,17 +425,11 @@ export const CloudSyncView: React.FC = () => {
               <div className="settings-field" style={{ marginBottom: 0 }}>
                 <span>Freshness Warning (Days)</span>
                 <input
-                  type="number"
+                  type="text"
+                  inputMode="numeric"
                   className="text-input"
-                  min={1}
-                  step={1}
-                  value={editing.stale_after_days}
-                  onChange={(e) =>
-                    setEditing({
-                      ...editing,
-                      stale_after_days: Math.max(1, Math.trunc(Number(e.target.value) || 7)),
-                    })
-                  }
+                  value={staleDaysText}
+                  onChange={(e) => setStaleDaysText(e.target.value)}
                 />
               </div>
             </div>
@@ -464,7 +477,7 @@ export const CloudSyncView: React.FC = () => {
             <button
               type="button"
               className="button button-primary"
-              onClick={() => setEditing({ ...BLANK_PROFILE })}
+              onClick={() => openEditor({ ...BLANK_PROFILE })}
             >
               <Plus size={14} /> Add Cloud Profile
             </button>
@@ -541,7 +554,7 @@ export const CloudSyncView: React.FC = () => {
                       type="button"
                       className="button button-quiet"
                       disabled={isBusy}
-                      onClick={() => setEditing(p)}
+                      onClick={() => openEditor(p)}
                     >
                       Edit
                     </button>

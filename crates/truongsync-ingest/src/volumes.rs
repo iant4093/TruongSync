@@ -35,9 +35,16 @@ fn is_macos_real_volume_mount(vol_mount: &Path) -> bool {
 pub fn disk_free_bytes(path: &Path) -> Result<u64> {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(rel) = path.strip_prefix("/Volumes") {
-            if let Some(first) = rel.components().next() {
-                let vol_mount = Path::new("/Volumes").join(first.as_os_str());
+        use std::path::Component;
+        let mut comps = path.components();
+        if matches!(comps.next(), Some(Component::RootDir))
+            && matches!(
+                comps.next(),
+                Some(Component::Normal(seg)) if seg.to_string_lossy().eq_ignore_ascii_case("Volumes")
+            )
+        {
+            if let Some(Component::Normal(first)) = comps.next() {
+                let vol_mount = Path::new("/Volumes").join(first);
                 let is_root_symlink = std::fs::symlink_metadata(&vol_mount)
                     .map(|m| m.file_type().is_symlink())
                     .unwrap_or(false);
@@ -619,18 +626,39 @@ pub fn eject_volume(mount_path: &Path) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::ffi::OsStrExt;
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
         use windows::core::PCWSTR;
-        use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
+        use windows::Win32::Devices::DeviceAndDriverInstallation::{
+            CM_Get_Parent, CM_Request_Device_EjectW, PNP_VetoTypeUnknown,
+            SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+            SetupDiGetDeviceInterfaceDetailW, CR_SUCCESS, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
+            HDEVINFO, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
+        };
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
         use windows::Win32::Storage::FileSystem::{
-            CreateFileW, GetDriveTypeW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, OPEN_EXISTING,
+            BusType1394, BusTypeMmc, BusTypeSd, BusTypeUsb, CreateFileW, GetDriveTypeW,
+            FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
         };
         use windows::Win32::System::Ioctl::{
-            FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, IOCTL_STORAGE_EJECT_MEDIA,
-            IOCTL_STORAGE_MEDIA_REMOVAL, PREVENT_MEDIA_REMOVAL,
+            PropertyStandardQuery, StorageDeviceProperty, GUID_DEVINTERFACE_DISK,
+            IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_QUERY_PROPERTY,
+            STORAGE_DEVICE_DESCRIPTOR, STORAGE_DEVICE_NUMBER, STORAGE_PROPERTY_QUERY,
         };
         use windows::Win32::System::IO::DeviceIoControl;
+
+        struct HandleGuard(HANDLE);
+        impl Drop for HandleGuard {
+            fn drop(&mut self) {
+                let _ = unsafe { CloseHandle(self.0) };
+            }
+        }
+        struct DevSetGuard(HDEVINFO);
+        impl Drop for DevSetGuard {
+            fn drop(&mut self) {
+                let _ = unsafe { SetupDiDestroyDeviceInfoList(self.0) };
+            }
+        }
 
         let drive =
             validate_windows_drive_root(&mount_path.to_string_lossy()).ok_or_else(|| {
@@ -644,93 +672,263 @@ pub fn eject_volume(mount_path: &Path) -> Result<()> {
                 return Err(anyhow!("Refusing to eject Windows system drive {drive}."));
             }
         }
+
         let root_w: Vec<u16> = std::ffi::OsStr::new(&format!(r"{drive}\"))
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        // DRIVE_REMOVABLE = 2; refuse to forcibly dismount fixed/network/system partitions.
+        const DRIVE_REMOVABLE: u32 = 2;
+        const DRIVE_FIXED: u32 = 3;
         let drive_type = unsafe { GetDriveTypeW(PCWSTR(root_w.as_ptr())) };
-        if drive_type != 2 {
+        if drive_type != DRIVE_REMOVABLE && drive_type != DRIVE_FIXED {
             return Err(anyhow!(
-                "Refusing to eject non-removable Windows volume {drive} (drive type {drive_type})."
+                "Refusing to eject unsupported Windows volume {drive} (drive type {drive_type})."
             ));
         }
+
+        // Open with desired_access = 0 (metadata query only): works for standard non-admin
+        // users AND physically write-protected SD cards.
         let dev_path = format!(r"\\.\{drive}");
         let wide: Vec<u16> = std::ffi::OsStr::new(&dev_path)
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let handle = unsafe {
-            CreateFileW(
-                PCWSTR(wide.as_ptr()),
-                GENERIC_READ.0 | GENERIC_WRITE.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAGS_AND_ATTRIBUTES(0),
-                None,
-            )
-        }
-        .map_err(|e| anyhow!("Could not open volume {drive} for eject: {e}"))?;
+        let vol_num: STORAGE_DEVICE_NUMBER = {
+            let handle = unsafe {
+                CreateFileW(
+                    PCWSTR(wide.as_ptr()),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAGS_AND_ATTRIBUTES(0),
+                    None,
+                )
+            }
+            .map_err(|e| anyhow!("Could not open volume {drive} for safe eject: {e}"))?;
+            let _h_guard = HandleGuard(handle);
 
-        let mut bytes_returned = 0u32;
-        let result = (|| -> Result<()> {
+            // Verify the underlying bus is removable or external (USB / SD / MMC / 1394)
+            // so we allow USB CFexpress/SSD readers (`DRIVE_FIXED`) while blocking internal SATA/NVMe drives.
+            let mut is_external_bus = drive_type == DRIVE_REMOVABLE;
+            let query = STORAGE_PROPERTY_QUERY {
+                PropertyId: StorageDeviceProperty,
+                QueryType: PropertyStandardQuery,
+                AdditionalParameters: [0],
+            };
+            let mut desc_buf = [0u64; 64];
+            let mut desc_bytes = 0u32;
+            if unsafe {
+                DeviceIoControl(
+                    handle,
+                    IOCTL_STORAGE_QUERY_PROPERTY,
+                    Some((&query as *const STORAGE_PROPERTY_QUERY).cast()),
+                    std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+                    Some(desc_buf.as_mut_ptr().cast()),
+                    std::mem::size_of_val(&desc_buf) as u32,
+                    Some(&mut desc_bytes),
+                    None,
+                )
+            }
+            .is_ok()
+                && (desc_bytes as usize) >= std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>()
+            {
+                let desc = unsafe { &*(desc_buf.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>()) };
+                if desc.RemovableMedia
+                    || matches!(
+                        desc.BusType,
+                        BusTypeUsb | BusTypeSd | BusTypeMmc | BusType1394
+                    )
+                {
+                    is_external_bus = true;
+                }
+            }
+            if !is_external_bus {
+                return Err(anyhow!(
+                    "Refusing to eject internal fixed Windows volume {drive}."
+                ));
+            }
+
+            let mut sdn = STORAGE_DEVICE_NUMBER {
+                DeviceType: 0,
+                DeviceNumber: 0,
+                PartitionNumber: 0,
+            };
+            let mut returned = 0u32;
             unsafe {
                 DeviceIoControl(
                     handle,
-                    FSCTL_LOCK_VOLUME,
+                    IOCTL_STORAGE_GET_DEVICE_NUMBER,
                     None,
                     0,
-                    None,
-                    0,
-                    Some(&mut bytes_returned),
+                    Some((&mut sdn as *mut STORAGE_DEVICE_NUMBER).cast()),
+                    std::mem::size_of::<STORAGE_DEVICE_NUMBER>() as u32,
+                    Some(&mut returned),
                     None,
                 )
-                .map_err(|e| anyhow!("Volume {drive} is in use by another program: {e}"))?;
-
-                DeviceIoControl(
-                    handle,
-                    FSCTL_DISMOUNT_VOLUME,
-                    None,
-                    0,
-                    None,
-                    0,
-                    Some(&mut bytes_returned),
-                    None,
-                )
-                .map_err(|e| anyhow!("Failed to dismount volume {drive}: {e}"))?;
-
-                let allow = PREVENT_MEDIA_REMOVAL {
-                    PreventMediaRemoval: false,
-                };
-                let _ = DeviceIoControl(
-                    handle,
-                    IOCTL_STORAGE_MEDIA_REMOVAL,
-                    Some((&allow as *const PREVENT_MEDIA_REMOVAL).cast()),
-                    std::mem::size_of::<PREVENT_MEDIA_REMOVAL>() as u32,
-                    None,
-                    0,
-                    Some(&mut bytes_returned),
-                    None,
-                );
-
-                DeviceIoControl(
-                    handle,
-                    IOCTL_STORAGE_EJECT_MEDIA,
-                    None,
-                    0,
-                    None,
-                    0,
-                    Some(&mut bytes_returned),
-                    None,
-                )
-                .map_err(|e| anyhow!("Failed to eject removable media {drive}: {e}"))?;
             }
-            Ok(())
-        })();
+            .map_err(|e| anyhow!("Could not identify storage device for {drive}: {e}"))?;
+            sdn
+        };
 
-        let _ = unsafe { CloseHandle(handle) };
-        result
+        // Locate the matching disk device instance via SetupAPI, then invoke PnP safe-remove
+        // (`CM_Request_Device_EjectW`), which flushes/dismounts cleanly without Admin elevation.
+        let dev_set = unsafe {
+            SetupDiGetClassDevsW(
+                Some(&GUID_DEVINTERFACE_DISK),
+                PCWSTR::null(),
+                None,
+                DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+            )
+        }
+        .map_err(|e| anyhow!("Could not enumerate Windows disk devices for eject: {e}"))?;
+        let _set_guard = DevSetGuard(dev_set);
+
+        let mut matched_devinst: Option<u32> = None;
+        let mut idx = 0u32;
+        loop {
+            let mut iface_data = SP_DEVICE_INTERFACE_DATA {
+                cbSize: std::mem::size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+                ..Default::default()
+            };
+            if unsafe {
+                SetupDiEnumDeviceInterfaces(
+                    dev_set,
+                    None,
+                    &GUID_DEVINTERFACE_DISK,
+                    idx,
+                    &mut iface_data,
+                )
+            }
+            .is_err()
+            {
+                break;
+            }
+            idx += 1;
+
+            let mut req_size = 0u32;
+            let _ = unsafe {
+                SetupDiGetDeviceInterfaceDetailW(
+                    dev_set,
+                    &iface_data,
+                    None,
+                    0,
+                    Some(&mut req_size),
+                    None,
+                )
+            };
+            if req_size == 0 {
+                continue;
+            }
+            let mut detail_words = vec![0u64; (req_size as usize).div_ceil(8)];
+            let detail_ptr = detail_words
+                .as_mut_ptr()
+                .cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
+            unsafe {
+                (*detail_ptr).cbSize =
+                    std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+            }
+            let mut dev_info = SP_DEVINFO_DATA {
+                cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+                ..Default::default()
+            };
+            if unsafe {
+                SetupDiGetDeviceInterfaceDetailW(
+                    dev_set,
+                    &iface_data,
+                    Some(detail_ptr),
+                    req_size,
+                    None,
+                    Some(&mut dev_info),
+                )
+            }
+            .is_err()
+            {
+                continue;
+            }
+            let dev_path_ptr =
+                unsafe { std::ptr::addr_of!((*detail_ptr).DevicePath).cast::<u16>() };
+            let Ok(disk_handle) = (unsafe {
+                CreateFileW(
+                    PCWSTR(dev_path_ptr),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAGS_AND_ATTRIBUTES(0),
+                    None,
+                )
+            }) else {
+                continue;
+            };
+            let _disk_guard = HandleGuard(disk_handle);
+            let mut disk_sdn = STORAGE_DEVICE_NUMBER {
+                DeviceType: 0,
+                DeviceNumber: 0,
+                PartitionNumber: 0,
+            };
+            let mut ret = 0u32;
+            if unsafe {
+                DeviceIoControl(
+                    disk_handle,
+                    IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                    None,
+                    0,
+                    Some((&mut disk_sdn as *mut STORAGE_DEVICE_NUMBER).cast()),
+                    std::mem::size_of::<STORAGE_DEVICE_NUMBER>() as u32,
+                    Some(&mut ret),
+                    None,
+                )
+            }
+            .is_ok()
+                && disk_sdn.DeviceType == vol_num.DeviceType
+                && disk_sdn.DeviceNumber == vol_num.DeviceNumber
+            {
+                matched_devinst = Some(dev_info.DevInst);
+                break;
+            }
+        }
+
+        let dev_inst = matched_devinst
+            .ok_or_else(|| anyhow!("Could not locate removable device node for {drive}."))?;
+
+        let try_pnp_eject = |node: u32| -> Result<(), String> {
+            let mut veto_type = PNP_VetoTypeUnknown;
+            let mut veto_buf = [0u16; 256];
+            let cr = unsafe {
+                CM_Request_Device_EjectW(node, Some(&mut veto_type), Some(&mut veto_buf), 0)
+            };
+            if cr == CR_SUCCESS && veto_type == PNP_VetoTypeUnknown {
+                return Ok(());
+            }
+            let end = veto_buf
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(veto_buf.len());
+            let veto_name = OsString::from_wide(&veto_buf[..end])
+                .to_string_lossy()
+                .trim()
+                .to_string();
+            if veto_name.is_empty() {
+                Err(format!(
+                    "PnP eject returned code {} (veto {})",
+                    cr.0, veto_type.0
+                ))
+            } else {
+                Err(format!("in use by {veto_name}"))
+            }
+        };
+
+        // On USB readers/SSDs the ejectable PnP node is the parent USB Mass Storage device;
+        // on built-in SD controllers it can be the disk node itself. Try parent first, then disk.
+        let mut parent_inst = 0u32;
+        if unsafe { CM_Get_Parent(&mut parent_inst, dev_inst, 0) } == CR_SUCCESS
+            && try_pnp_eject(parent_inst).is_ok()
+        {
+            return Ok(());
+        }
+        try_pnp_eject(dev_inst)
+            .map_err(|reason| anyhow!("Could not safely eject {drive}: {reason}"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

@@ -152,6 +152,9 @@ pub fn sanitize_filename(raw: &str) -> Option<String> {
     if is_windows_reserved_name(&cleaned) {
         cleaned.insert(0, '_');
     }
+    if truongsync_db::models::is_mac_metadata_path(&cleaned) {
+        cleaned = format!("_{}", cleaned.trim_start_matches('.'));
+    }
     Some(cleaned)
 }
 

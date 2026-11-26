@@ -102,6 +102,7 @@ export const api = {
     invoke<PipelineSummary>('run_import_pipeline', { req }),
   cancelActiveJob: (jobId?: string) =>
     invoke<boolean>('cancel_active_job', { jobId: jobId ?? null }),
+  cancelOAuth: () => invoke<boolean>('cancel_oauth'),
 
   findMatchingGpx: (earliestUtc: string, latestUtc: string, folderOverride?: string) =>
     invoke<WatchedGpxMatch[]>('find_matching_gpx', {

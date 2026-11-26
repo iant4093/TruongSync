@@ -4,7 +4,7 @@ use chrono::DateTime;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -15,7 +15,7 @@ use truongsync_db::models::{
 };
 use truongsync_db::DbHandle;
 use truongsync_geo::exiftool::{
-    check_exiftool, write_geotags_batch, GeotagExecutionResult, ToolAvailability,
+    check_exiftool, write_geotags_batch_with_hook, GeotagExecutionResult, ToolAvailability,
 };
 use truongsync_geo::gpx::{find_matching_gpx_files, load_gpx_files, WatchedGpxMatch};
 use truongsync_geo::matcher::{build_geotag_plan, GeotagPlan, PhotoGpsMatch};
@@ -109,20 +109,31 @@ impl Drop for ProfileLockGuard {
                 match kind {
                     LockKind::Cloud => {
                         if spec.restore_mode {
-                            let _ = run_locked_cloud_sync_background(&app, &pid, true, true).await;
+                            let (_, cancelled) =
+                                run_locked_cloud_sync_background_inner(&app, &pid, true, true)
+                                    .await;
+                            if cancelled {
+                                return;
+                            }
                         }
                         if spec.normal_sync {
-                            let _ = run_locked_cloud_sync_background(&app, &pid, true, false).await;
+                            let _ = run_locked_cloud_sync_background_inner(&app, &pid, true, false)
+                                .await;
                         }
                     }
                     LockKind::External => {
                         if spec.restore_mode {
-                            let _ =
-                                run_locked_external_sync_background(&app, &pid, true, true).await;
+                            let (_, cancelled) =
+                                run_locked_external_sync_background_inner(&app, &pid, true, true)
+                                    .await;
+                            if cancelled {
+                                return;
+                            }
                         }
                         if spec.normal_sync {
                             let _ =
-                                run_locked_external_sync_background(&app, &pid, true, false).await;
+                                run_locked_external_sync_background_inner(&app, &pid, true, false)
+                                    .await;
                         }
                     }
                 }
@@ -160,6 +171,7 @@ pub struct AppState {
     pub initial_import_volume: Mutex<Option<String>>,
     bootstrapped: AtomicBool,
     import_running: Arc<AtomicBool>,
+    geotag_running: Arc<AtomicBool>,
     update_running: Arc<AtomicBool>,
     pub deferred_on_connect: Mutex<HashSet<String>>,
     active_cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
@@ -175,6 +187,7 @@ impl AppState {
             initial_import_volume: Mutex::new(initial_import_volume),
             bootstrapped: AtomicBool::new(false),
             import_running: Arc::new(AtomicBool::new(false)),
+            geotag_running: Arc::new(AtomicBool::new(false)),
             update_running: Arc::new(AtomicBool::new(false)),
             deferred_on_connect: Mutex::new(HashSet::new()),
             active_cancels: Arc::new(Mutex::new(HashMap::new())),
@@ -201,6 +214,28 @@ impl AppState {
         } else {
             None
         }
+    }
+
+    pub fn is_import_running(&self) -> bool {
+        self.import_running.load(Ordering::SeqCst)
+    }
+
+    pub fn try_lock_geotag(&self) -> Option<FlagLockGuard> {
+        if self
+            .geotag_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Some(FlagLockGuard {
+                flag: Arc::clone(&self.geotag_running),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn is_geotag_running(&self) -> bool {
+        self.geotag_running.load(Ordering::SeqCst)
     }
 
     pub fn try_lock_update(&self) -> Option<FlagLockGuard> {
@@ -274,6 +309,18 @@ impl AppState {
             return true;
         }
         false
+    }
+
+    pub fn cancel_by_prefix(&self, prefix: &str) -> bool {
+        let guard = self.active_cancels.lock();
+        let mut matched = false;
+        for (id, tok) in guard.iter() {
+            if id.starts_with(prefix) {
+                tok.cancel();
+                matched = true;
+            }
+        }
+        matched
     }
 
     pub fn cancel_all_active(&self) -> bool {
@@ -350,12 +397,23 @@ pub async fn run_locked_cloud_sync_background(
     do_sync: bool,
     restore_mode: bool,
 ) -> bool {
+    run_locked_cloud_sync_background_inner(app, profile_id, do_sync, restore_mode)
+        .await
+        .0
+}
+
+async fn run_locked_cloud_sync_background_inner(
+    app: &AppHandle,
+    profile_id: &str,
+    do_sync: bool,
+    restore_mode: bool,
+) -> (bool, bool) {
     let Some(state) = app.try_state::<AppState>() else {
-        return false;
+        return (false, false);
     };
     let followup = FollowupSpec::from_sync(do_sync, restore_mode);
     let Some(lock_guard) = state.try_lock_cloud(profile_id, Some(app.clone()), followup) else {
-        return false;
+        return (false, false);
     };
     let cancel_reg = state.register_cancel(&format!("bg-cloud:{profile_id}"));
     let cancel = cancel_reg.token.clone();
@@ -401,6 +459,7 @@ pub async fn run_locked_cloud_sync_background(
                         "job-progress",
                         JobProgressEvent {
                             job_id: jid_p.clone(),
+                            job_kind: "cloud".into(),
                             stage: "cloud".into(),
                             message: msg.to_string(),
                             files_done: done,
@@ -477,10 +536,11 @@ pub async fn run_locked_cloud_sync_background(
     .await
     .unwrap_or(false);
 
-    if cancel_reg.token.is_cancelled() {
+    let cancelled = cancel_reg.token.is_cancelled();
+    if cancelled {
         lock_guard.suppress_followup_on_cancel();
     }
-    ok
+    (ok, cancelled)
 }
 
 /// Shared background External Drive sync/verify runner with RAII per-profile locking & job history.
@@ -490,12 +550,23 @@ pub async fn run_locked_external_sync_background(
     do_sync: bool,
     restore_mode: bool,
 ) -> bool {
+    run_locked_external_sync_background_inner(app, profile_id, do_sync, restore_mode)
+        .await
+        .0
+}
+
+async fn run_locked_external_sync_background_inner(
+    app: &AppHandle,
+    profile_id: &str,
+    do_sync: bool,
+    restore_mode: bool,
+) -> (bool, bool) {
     let Some(state) = app.try_state::<AppState>() else {
-        return false;
+        return (false, false);
     };
     let followup = FollowupSpec::from_sync(do_sync, restore_mode);
     let Some(lock_guard) = state.try_lock_external(profile_id, Some(app.clone()), followup) else {
-        return false;
+        return (false, false);
     };
     let cancel_reg = state.register_cancel(&format!("bg-ext:{profile_id}"));
     let cancel = cancel_reg.token.clone();
@@ -535,6 +606,7 @@ pub async fn run_locked_external_sync_background(
                         "job-progress",
                         JobProgressEvent {
                             job_id: jid_p.clone(),
+                            job_kind: "external".into(),
                             stage: "external".into(),
                             message: msg.to_string(),
                             files_done: done,
@@ -604,10 +676,11 @@ pub async fn run_locked_external_sync_background(
     .await
     .unwrap_or(false);
 
-    if cancel_reg.token.is_cancelled() {
+    let cancelled = cancel_reg.token.is_cancelled();
+    if cancelled {
         lock_guard.suppress_followup_on_cancel();
     }
-    ok
+    (ok, cancelled)
 }
 
 fn validate_schedule(mode: &str, value: &str) -> Result<(), String> {
@@ -664,6 +737,7 @@ pub struct ToolsStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct JobProgressEvent {
     pub job_id: String,
+    pub job_kind: String,
     pub stage: String,
     pub message: String,
     pub files_done: usize,
@@ -702,8 +776,125 @@ pub struct PipelineSummary {
     pub cloud_synced_profiles: usize,
     pub external_synced_profiles: usize,
     pub ejected: bool,
+    pub cancelled: bool,
     pub stage_errors: usize,
     pub notes: Vec<String>,
+}
+
+fn canonical_or_norm(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    let ca = canonical_or_norm(a);
+    let cb = canonical_or_norm(b);
+    if ca == cb || ca.starts_with(&cb) || cb.starts_with(&ca) {
+        return true;
+    }
+    truongsync_db::models::relative_normalized(&ca, &cb).is_some()
+        || truongsync_db::models::relative_normalized(&cb, &ca).is_some()
+}
+
+fn existing_ancestor_for_mount(p: &Path) -> PathBuf {
+    let mut cur = p.to_path_buf();
+    while !cur.exists() {
+        match cur.parent() {
+            Some(parent) if parent != cur && !parent.as_os_str().is_empty() => {
+                cur = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+    cur
+}
+
+fn same_volume_mount(source_root: &Path, dest_root: &Path) -> bool {
+    let src_anc = existing_ancestor_for_mount(source_root);
+    let dst_anc = existing_ancestor_for_mount(dest_root);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(sm), Ok(dm)) = (std::fs::metadata(&src_anc), std::fs::metadata(&dst_anc)) {
+            return sm.dev() == dm.dev();
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::GetVolumePathNameW;
+
+        let vol_root = |p: &Path| -> Option<String> {
+            let wide: Vec<u16> = p
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut buf = vec![0u16; 512];
+            unsafe { GetVolumePathNameW(PCWSTR(wide.as_ptr()), &mut buf) }.ok()?;
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            Some(
+                OsString::from_wide(&buf[..end])
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        };
+        if let (Some(sv), Some(dv)) = (vol_root(&src_anc), vol_root(&dst_anc)) {
+            return sv.eq_ignore_ascii_case(&dv);
+        }
+    }
+    paths_overlap(&src_anc, &dst_anc)
+}
+
+type OverlappingProfileLocks = (
+    HashMap<String, ProfileLockGuard>,
+    HashMap<String, ProfileLockGuard>,
+);
+
+/// Acquires per-profile RAII locks for all Cloud and External profiles whose `local_root`
+/// overlaps any target path being mutated by Import or Geotag, preventing concurrent syncs
+/// from uploading un-geotagged files, reading `_exiftool_tmp`, or racing `intentional_updates`.
+fn lock_overlapping_profiles(
+    state: &AppState,
+    app: &AppHandle,
+    targets: &[PathBuf],
+    action_label: &str,
+) -> Result<OverlappingProfileLocks, String> {
+    let mut cloud_profiles = state.db.list_cloud_profiles().map_err(map_err)?;
+    cloud_profiles.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut ext_profiles = state.db.list_external_profiles().map_err(map_err)?;
+    ext_profiles.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut cloud_guards = HashMap::new();
+    for p in cloud_profiles {
+        let p_root = Path::new(p.local_root.trim());
+        if !p.local_root.trim().is_empty() && targets.iter().any(|t| paths_overlap(p_root, t)) {
+            let Some(g) = state.try_lock_cloud(&p.id, Some(app.clone()), None) else {
+                return Err(format!(
+                    "Cannot {action_label} while Google Drive profile '{}' is actively syncing or verifying this folder.",
+                    p.name
+                ));
+            };
+            cloud_guards.insert(p.id, g);
+        }
+    }
+
+    let mut ext_guards = HashMap::new();
+    for p in ext_profiles {
+        let p_root = Path::new(p.local_root.trim());
+        if !p.local_root.trim().is_empty() && targets.iter().any(|t| paths_overlap(p_root, t)) {
+            let Some(g) = state.try_lock_external(&p.id, Some(app.clone()), None) else {
+                return Err(format!(
+                    "Cannot {action_label} while external backup profile '{}' is actively syncing or verifying this folder.",
+                    p.name
+                ));
+            };
+            ext_guards.insert(p.id, g);
+        }
+    }
+
+    Ok((cloud_guards, ext_guards))
 }
 
 fn map_err(err: anyhow::Error) -> String {
@@ -949,12 +1140,17 @@ pub fn preview_import_plan(
 
 #[tauri::command]
 pub fn cancel_active_job(state: State<'_, AppState>, job_id: Option<String>) -> bool {
+    // When a specific `job_id` is targeted, ONLY cancel that exact job (never fall through to
+    // `cancel_all_active()`, which could abort unrelated concurrent jobs if `job_id` just finished).
     if let Some(id) = job_id.filter(|s| !s.trim().is_empty()) {
-        if state.cancel_by_id(&id) {
-            return true;
-        }
+        return state.cancel_by_id(&id);
     }
     state.cancel_all_active()
+}
+
+#[tauri::command]
+pub fn cancel_oauth(state: State<'_, AppState>) -> bool {
+    state.cancel_by_prefix("oauth#")
 }
 
 #[tauri::command]
@@ -966,6 +1162,15 @@ pub async fn run_import_pipeline(
     let Some(_import_guard) = state.try_lock_import() else {
         return Err("An SD card import pipeline is already running.".into());
     };
+    if state.is_geotag_running() {
+        return Err(
+            "Cannot start an SD card import while an EXIF GPS geotag batch is running.".into(),
+        );
+    }
+    let dest_target = PathBuf::from(req.dest_root.trim());
+    let (mut held_cloud_locks, mut held_ext_locks) =
+        lock_overlapping_profiles(&state, &app, &[dest_target], "start SD card import")?;
+
     let settings = state.db.load_settings().map_err(map_err)?;
     let db = state.db.clone();
     let paths = state.paths.clone();
@@ -1021,6 +1226,7 @@ pub async fn run_import_pipeline(
                     "job-progress",
                     JobProgressEvent {
                         job_id: jid_prog.clone(),
+                        job_kind: "pipeline".into(),
                         stage: "import".into(),
                         message: format!("Importing {} / {} files…", p.files_done, p.files_total),
                         files_done: p.files_done,
@@ -1034,6 +1240,14 @@ pub async fn run_import_pipeline(
         ) {
             Ok(r) => r,
             Err(e) => {
+                if cancel.is_cancelled() {
+                    for g in held_cloud_locks.values() {
+                        g.suppress_followup_on_cancel();
+                    }
+                    for g in held_ext_locks.values() {
+                        g.suppress_followup_on_cancel();
+                    }
+                }
                 let st = if cancel.is_cancelled() {
                     "cancelled"
                 } else {
@@ -1053,7 +1267,7 @@ pub async fn run_import_pipeline(
         let mut stage_errors = 0usize;
         let mut geotag_res: Option<GeotagExecutionResult> = None;
 
-        // Stage 2: Inline EXIF GPS Geotagging (Photos only, BEFORE Google Drive sync!)
+        // Stage 2: Inline EXIF GPS Geotagging (Photos only, BEFORE Google Drive / External sync!)
         if req.geotag_enabled
             && !req.gpx_files.is_empty()
             && !import_res.dest_photo_paths.is_empty()
@@ -1063,6 +1277,7 @@ pub async fn run_import_pipeline(
                 "job-progress",
                 JobProgressEvent {
                     job_id: job_id.clone(),
+                    job_kind: "pipeline".into(),
                     stage: "geotag".into(),
                     message: "Matching photos to GPX track…".into(),
                     files_done: 0,
@@ -1072,6 +1287,12 @@ pub async fn run_import_pipeline(
                     speed_bps: 0,
                 },
             );
+            let dup_set: HashSet<String> = import_res
+                .skipped_duplicate_photo_paths
+                .iter()
+                .cloned()
+                .collect();
+            let db_hook = db.clone();
             match load_gpx_files(&req.gpx_files).and_then(|gpx| {
                 let gt_plan = build_geotag_plan(
                     &import_res.dest_photo_paths,
@@ -1083,7 +1304,7 @@ pub async fn run_import_pipeline(
                 )?;
                 let app_g = app.clone();
                 let jid_g = job_id.clone();
-                write_geotags_batch(
+                write_geotags_batch_with_hook(
                     &gt_plan.items,
                     settings.exiftool_path_override.as_deref(),
                     settings.bump_mtime_on_backfill,
@@ -1093,6 +1314,7 @@ pub async fn run_import_pipeline(
                             "job-progress",
                             JobProgressEvent {
                                 job_id: jid_g.clone(),
+                                job_kind: "pipeline".into(),
                                 stage: "geotag".into(),
                                 message: format!("Geotagging {name} ({done}/{total})…"),
                                 files_done: done,
@@ -1103,24 +1325,20 @@ pub async fn run_import_pipeline(
                             },
                         );
                     },
-                )
-            }) {
-                Ok(g) => {
-                    let dup_set: HashSet<&str> = import_res
-                        .skipped_duplicate_photo_paths
-                        .iter()
-                        .map(String::as_str)
-                        .collect();
-                    for rec in &g.updated_records {
-                        if dup_set.contains(rec.path.as_str()) {
-                            let _ = db.record_intentional_update(
+                    move |rec| {
+                        // Persist backfill hashes immediately per file for already-existing duplicates
+                        if dup_set.contains(&rec.path) {
+                            let _ = db_hook.record_intentional_update(
                                 &rec.path,
                                 &rec.pre_md5,
                                 &rec.post_md5,
                                 "gps_backfill",
                             );
                         }
-                    }
+                    },
+                )
+            }) {
+                Ok(g) => {
                     if g.failed_count > 0 {
                         stage_errors += g.failed_count;
                     }
@@ -1137,9 +1355,33 @@ pub async fn run_import_pipeline(
             }
         }
 
-        // Optional safe eject only if plan was non-empty, zero import failures, and dest_root is not on the same volume
+        // Release overlapping locks for profiles NOT explicitly selected for Stage 3/4 so any
+        // queued scheduled syncs on other profiles can now proceed safely after Stage 2 finishes.
+        let selected_cloud: HashSet<&str> =
+            req.cloud_profile_ids.iter().map(String::as_str).collect();
+        let selected_ext: HashSet<&str> = req
+            .external_profile_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if cancel.is_cancelled() {
+            for g in held_cloud_locks.values() {
+                g.suppress_followup_on_cancel();
+            }
+            for g in held_ext_locks.values() {
+                g.suppress_followup_on_cancel();
+            }
+            held_cloud_locks.clear();
+            held_ext_locks.clear();
+        } else {
+            held_cloud_locks.retain(|id, _| selected_cloud.contains(id.as_str()));
+            held_ext_locks.retain(|id, _| selected_ext.contains(id.as_str()));
+        }
+
+        // Optional safe eject only if plan was non-empty, zero import failures, and dest_root is on a different volume
         let mut ejected = false;
-        let same_mount = Path::new(req.dest_root.trim()).starts_with(Path::new(req.source_root.trim()));
+        let same_mount =
+            same_volume_mount(Path::new(req.source_root.trim()), Path::new(req.dest_root.trim()));
         if req.eject_after
             && !plan.is_empty()
             && !same_mount
@@ -1155,21 +1397,30 @@ pub async fn run_import_pipeline(
             }
         }
 
-        // Stage 3: Google Drive Sync (acquires per-profile RAII lock; queues follow-up sync if busy!)
+        // Stage 3: Google Drive Sync (reuses held overlapping lock or acquires per-profile RAII lock!)
         let mut cloud_synced = 0usize;
         if import_res.files_failed == 0 && !cancel.is_cancelled() {
             if let Some(st) = app.try_state::<AppState>() {
                 for pid in &req.cloud_profile_ids {
-                    let Some(lock) = st.try_lock_cloud(
-                        pid,
-                        Some(app.clone()),
-                        FollowupSpec::from_sync(true, false),
-                    ) else {
-                        notes.push(
-                            "Google Drive sync for profile already running; queued automatic follow-up pass."
-                                .to_string(),
-                        );
-                        continue;
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    let lock = match held_cloud_locks.remove(pid) {
+                        Some(existing) => existing,
+                        None => match st.try_lock_cloud(
+                            pid,
+                            Some(app.clone()),
+                            FollowupSpec::from_sync(true, false),
+                        ) {
+                            Some(g) => g,
+                            None => {
+                                notes.push(
+                                    "Google Drive sync for profile already running; queued automatic follow-up pass."
+                                        .to_string(),
+                                );
+                                continue;
+                            }
+                        },
                     };
                     if let Ok(Some(profile)) = db.get_cloud_profile(pid) {
                         let app_c = app.clone();
@@ -1186,6 +1437,7 @@ pub async fn run_import_pipeline(
                                     "job-progress",
                                     JobProgressEvent {
                                         job_id: jid_c.clone(),
+                                        job_kind: "pipeline".into(),
                                         stage: "cloud".into(),
                                         message: msg.to_string(),
                                         files_done: done,
@@ -1199,15 +1451,39 @@ pub async fn run_import_pipeline(
                         ) {
                             Ok(c) => {
                                 cloud_synced += 1;
+                                if c.failed_count > 0 || c.conflicts_count > 0 {
+                                    stage_errors += c.failed_count + c.conflicts_count;
+                                }
+                                let mut suffix = String::new();
+                                if c.failed_count > 0 {
+                                    suffix.push_str(&format!(", {} failed", c.failed_count));
+                                }
+                                if c.conflicts_count > 0 {
+                                    suffix.push_str(&format!(
+                                        ", {} conflict(s) skipped",
+                                        c.conflicts_count
+                                    ));
+                                }
                                 notes.push(format!(
-                                    "Google Drive '{}': ↑{} uploaded, ↓{} downloaded.",
+                                    "Google Drive '{}': ↑{} uploaded, ↓{} downloaded{suffix}.",
                                     profile.name, c.uploaded_count, c.downloaded_count
                                 ));
                             }
                             Err(e) => {
                                 if cancel.is_cancelled() {
                                     lock.suppress_followup_on_cancel();
+                                    break;
                                 } else {
+                                    let _ = db.update_cloud_freshness(
+                                        &profile.id,
+                                        false,
+                                        false,
+                                        "failed",
+                                        Some(&e.to_string()),
+                                        profile.pending_upload_count,
+                                        profile.pending_download_count,
+                                        profile.pending_bytes,
+                                    );
                                     stage_errors += 1;
                                     notes.push(format!(
                                         "Google Drive '{}' error: {e}",
@@ -1226,21 +1502,30 @@ pub async fn run_import_pipeline(
             );
         }
 
-        // Stage 4: External Drive Sync (acquires per-profile RAII external lock with follow-up queue!)
+        // Stage 4: External Drive Sync (reuses held overlapping lock or acquires per-profile RAII external lock!)
         let mut external_synced = 0usize;
         if import_res.files_failed == 0 && !cancel.is_cancelled() {
             if let Some(st) = app.try_state::<AppState>() {
                 for pid in &req.external_profile_ids {
-                    let Some(lock) = st.try_lock_external(
-                        pid,
-                        Some(app.clone()),
-                        FollowupSpec::from_sync(true, false),
-                    ) else {
-                        notes.push(
-                            "External drive sync already running; queued automatic follow-up pass."
-                                .to_string(),
-                        );
-                        continue;
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    let lock = match held_ext_locks.remove(pid) {
+                        Some(existing) => existing,
+                        None => match st.try_lock_external(
+                            pid,
+                            Some(app.clone()),
+                            FollowupSpec::from_sync(true, false),
+                        ) {
+                            Some(g) => g,
+                            None => {
+                                notes.push(
+                                    "External drive sync already running; queued automatic follow-up pass."
+                                        .to_string(),
+                                );
+                                continue;
+                            }
+                        },
                     };
                     if let Ok(Some(profile)) = db.get_external_profile(pid) {
                         if truongsync_sync::external::resolve_external_target(&profile).is_none() {
@@ -1263,6 +1548,7 @@ pub async fn run_import_pipeline(
                                     "job-progress",
                                     JobProgressEvent {
                                         job_id: jid_e.clone(),
+                                        job_kind: "pipeline".into(),
                                         stage: "external".into(),
                                         message: msg.to_string(),
                                         files_done: done,
@@ -1294,7 +1580,18 @@ pub async fn run_import_pipeline(
                             Err(e) => {
                                 if cancel.is_cancelled() {
                                     lock.suppress_followup_on_cancel();
+                                    break;
                                 } else {
+                                    let _ = db.update_external_freshness(
+                                        &profile.id,
+                                        false,
+                                        false,
+                                        "failed",
+                                        Some(&e.to_string()),
+                                        profile.pending_push_count,
+                                        profile.pending_pull_count,
+                                        profile.pending_bytes,
+                                    );
                                     stage_errors += 1;
                                     notes.push(format!("External '{}' error: {e}", profile.name));
                                 }
@@ -1305,6 +1602,18 @@ pub async fn run_import_pipeline(
             }
         }
 
+        if cancel.is_cancelled() {
+            for g in held_cloud_locks.values() {
+                g.suppress_followup_on_cancel();
+            }
+            for g in held_ext_locks.values() {
+                g.suppress_followup_on_cancel();
+            }
+        }
+        drop(held_cloud_locks);
+        drop(held_ext_locks);
+
+        let was_cancelled = cancel.is_cancelled();
         let summary = PipelineSummary {
             job_id: job_id.clone(),
             import: import_res.clone(),
@@ -1312,11 +1621,12 @@ pub async fn run_import_pipeline(
             cloud_synced_profiles: cloud_synced,
             external_synced_profiles: external_synced,
             ejected,
+            cancelled: was_cancelled,
             stage_errors,
             notes,
         };
 
-        let status = if cancel.is_cancelled() {
+        let status = if was_cancelled {
             "cancelled"
         } else if import_res.files_failed > 0 || stage_errors > 0 {
             "partial"
@@ -1403,12 +1713,31 @@ pub async fn run_geotag(
     items: Vec<PhotoGpsMatch>,
     record_backfill_updates: bool,
 ) -> Result<GeotagExecutionResult, String> {
+    let Some(_geotag_guard) = state.try_lock_geotag() else {
+        return Err("An EXIF GPS geotag batch is already running.".into());
+    };
+    if state.is_import_running() {
+        return Err(
+            "Cannot run standalone geotagging while an SD card import pipeline is running.".into(),
+        );
+    }
+    let unique_dirs: Vec<PathBuf> = {
+        let mut set = HashSet::new();
+        for item in &items {
+            let p = Path::new(&item.path);
+            set.insert(p.parent().unwrap_or(p).to_path_buf());
+        }
+        set.into_iter().collect()
+    };
+    let (held_cloud_locks, held_ext_locks) =
+        lock_overlapping_profiles(&state, &app, &unique_dirs, "write GPS EXIF")?;
+
     let settings = state.db.load_settings().map_err(map_err)?;
     let db = state.db.clone();
     let cancel_reg = state.register_cancel("geotag");
     let cancel = cancel_reg.token.clone();
 
-    tokio::task::spawn_blocking(move || -> anyhow::Result<GeotagExecutionResult> {
+    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<GeotagExecutionResult> {
         let _guard = SleepGuard::acquire(settings.prevent_sleep_during_transfers);
         let job_id = db.create_job("geotag", "EXIF GPS Geotag", items.len() as i64, 0)?;
         let _exact_cancel = app
@@ -1416,8 +1745,9 @@ pub async fn run_geotag(
             .map(|st| st.register_cancel_exact(job_id.clone(), cancel.clone()));
         let app_p = app.clone();
         let jid_p = job_id.clone();
+        let db_hook = db.clone();
 
-        let res = match write_geotags_batch(
+        let res = match write_geotags_batch_with_hook(
             &items,
             settings.exiftool_path_override.as_deref(),
             settings.bump_mtime_on_backfill,
@@ -1427,6 +1757,7 @@ pub async fn run_geotag(
                     "job-progress",
                     JobProgressEvent {
                         job_id: jid_p.clone(),
+                        job_kind: "geotag".into(),
                         stage: "geotag".into(),
                         message: format!("Writing GPS EXIF to {name} ({done}/{total})…"),
                         files_done: done,
@@ -1436,6 +1767,18 @@ pub async fn run_geotag(
                         speed_bps: 0,
                     },
                 );
+            },
+            move |rec| {
+                // Persist each `intentional_updates` row immediately after ExifTool updates
+                // the photo on disk so crash/power-loss/cancel never loses backfill hashes.
+                if record_backfill_updates {
+                    let _ = db_hook.record_intentional_update(
+                        &rec.path,
+                        &rec.pre_md5,
+                        &rec.post_md5,
+                        "gps_backfill",
+                    );
+                }
             },
         ) {
             Ok(r) => r,
@@ -1451,20 +1794,10 @@ pub async fn run_geotag(
             }
         };
 
-        if record_backfill_updates {
-            for rec in &res.updated_records {
-                let _ = db.record_intentional_update(
-                    &rec.path,
-                    &rec.pre_md5,
-                    &rec.post_md5,
-                    "gps_backfill",
-                );
-            }
-        }
         for (p, msg) in &res.failures {
             let _ = db.add_job_item(&job_id, "geotag", p, None, "failed", 0, Some(msg));
         }
-        let status = if cancel.is_cancelled() {
+        let status = if res.cancelled || cancel.is_cancelled() {
             "cancelled"
         } else if res.failed_count > 0 {
             "partial"
@@ -1485,8 +1818,20 @@ pub async fn run_geotag(
         Ok(res)
     })
     .await
-    .map_err(|e| e.to_string())?
-    .map_err(map_err)
+    .map_err(|e| e.to_string())?;
+
+    if cancel_reg.token.is_cancelled() {
+        for g in held_cloud_locks.values() {
+            g.suppress_followup_on_cancel();
+        }
+        for g in held_ext_locks.values() {
+            g.suppress_followup_on_cancel();
+        }
+    }
+    drop(held_cloud_locks);
+    drop(held_ext_locks);
+
+    res.map_err(map_err)
 }
 
 // ── Cloud Sync Commands ──────────────────────────────────────────────────────
@@ -1501,11 +1846,18 @@ pub fn save_cloud_profile(
     state: State<'_, AppState>,
     mut profile: CloudProfile,
 ) -> Result<String, String> {
-    if !profile.id.trim().is_empty() && state.is_cloud_locked(&profile.id) {
-        return Err(
-            "Cannot edit a Google Drive profile while it is actively syncing or verifying.".into(),
-        );
-    }
+    // Hold the per-profile lock across the DB write to eliminate TOCTOU races with background syncs.
+    let _edit_lock = if !profile.id.trim().is_empty() {
+        let Some(g) = state.try_lock_cloud(&profile.id, None, None) else {
+            return Err(
+                "Cannot edit a Google Drive profile while it is actively syncing or verifying."
+                    .into(),
+            );
+        };
+        Some(g)
+    } else {
+        None
+    };
     profile.local_root = profile.local_root.trim().to_string();
     if profile.name.trim().is_empty() || profile.local_root.is_empty() {
         return Err("Profile name and local folder root are required.".into());
@@ -1521,12 +1873,12 @@ pub fn save_cloud_profile(
 
 #[tauri::command]
 pub fn delete_cloud_profile(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    if state.is_cloud_locked(&id) {
+    let Some(_del_lock) = state.try_lock_cloud(&id, None, None) else {
         return Err(
             "Cannot delete a Google Drive profile while it is actively syncing or verifying."
                 .into(),
         );
-    }
+    };
     state.db.delete_cloud_profile(&id).map_err(map_err)
 }
 
@@ -1576,8 +1928,9 @@ pub async fn verify_cloud_cmd(
     profile_id: String,
     deep_md5: bool,
 ) -> Result<CloudVerifyReport, String> {
-    // Acquire lock WITH app handle so any sync queued during Verify runs automatically on drop!
-    let Some(_lock_guard) = state.try_lock_cloud(&profile_id, Some(app.clone()), None) else {
+    // Acquire lock WITH app handle so any sync queued during Verify runs automatically on drop,
+    // UNLESS the user cancels (or app exits/updates).
+    let Some(lock_guard) = state.try_lock_cloud(&profile_id, Some(app.clone()), None) else {
         return Err("A Google Drive sync or verify is already running for this profile.".into());
     };
     let settings = state.db.load_settings().map_err(map_err)?;
@@ -1591,7 +1944,7 @@ pub async fn verify_cloud_cmd(
     let cancel_reg = state.register_cancel(&format!("verify-cloud:{profile_id}"));
     let cancel = cancel_reg.token.clone();
 
-    let report = tokio::task::spawn_blocking(move || {
+    let res = tokio::task::spawn_blocking(move || {
         verify_cloud_profile_cancellable(
             &profile,
             &db,
@@ -1602,9 +1955,12 @@ pub async fn verify_cloud_cmd(
         )
     })
     .await
-    .map_err(|e| e.to_string())?
-    .map_err(map_err)?;
+    .map_err(|e| e.to_string())?;
 
+    if cancel_reg.token.is_cancelled() {
+        lock_guard.suppress_followup_on_cancel();
+    }
+    let report = res.map_err(map_err)?;
     let _ = app.emit("profiles-updated", ());
     Ok(report)
 }
@@ -1669,6 +2025,7 @@ pub async fn sync_cloud_cmd(
                     "job-progress",
                     JobProgressEvent {
                         job_id: jid_p.clone(),
+                        job_kind: "cloud".into(),
                         stage: "cloud".into(),
                         message: msg.to_string(),
                         files_done: done,
@@ -1746,12 +2103,17 @@ pub fn save_external_profile(
     state: State<'_, AppState>,
     mut profile: ExternalProfile,
 ) -> Result<String, String> {
-    if !profile.id.trim().is_empty() && state.is_external_locked(&profile.id) {
-        return Err(
-            "Cannot edit an external drive profile while it is actively syncing or verifying."
-                .into(),
-        );
-    }
+    let _edit_lock = if !profile.id.trim().is_empty() {
+        let Some(g) = state.try_lock_external(&profile.id, None, None) else {
+            return Err(
+                "Cannot edit an external drive profile while it is actively syncing or verifying."
+                    .into(),
+            );
+        };
+        Some(g)
+    } else {
+        None
+    };
     profile.local_root = profile.local_root.trim().to_string();
     if profile.name.trim().is_empty()
         || profile.local_root.is_empty()
@@ -1769,12 +2131,12 @@ pub fn save_external_profile(
 
 #[tauri::command]
 pub fn delete_external_profile(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    if state.is_external_locked(&id) {
+    let Some(_del_lock) = state.try_lock_external(&id, None, None) else {
         return Err(
             "Cannot delete an external drive profile while it is actively syncing or verifying."
                 .into(),
         );
-    }
+    };
     state.db.delete_external_profile(&id).map_err(map_err)
 }
 
@@ -1785,7 +2147,7 @@ pub async fn verify_external_cmd(
     profile_id: String,
     deep_md5: bool,
 ) -> Result<ExternalVerifyReport, String> {
-    let Some(_lock_guard) = state.try_lock_external(&profile_id, Some(app.clone()), None) else {
+    let Some(lock_guard) = state.try_lock_external(&profile_id, Some(app.clone()), None) else {
         return Err("An external drive sync or verify is already running for this profile.".into());
     };
     let profile = state
@@ -1796,12 +2158,15 @@ pub async fn verify_external_cmd(
     let db = state.db.clone();
     let cancel_reg = state.register_cancel(&format!("verify-ext:{profile_id}"));
     let cancel = cancel_reg.token.clone();
-    let report = tokio::task::spawn_blocking(move || {
+    let res = tokio::task::spawn_blocking(move || {
         verify_external_profile_cancellable(&profile, &db, deep_md5, &cancel)
     })
     .await
-    .map_err(|e| e.to_string())?
-    .map_err(map_err)?;
+    .map_err(|e| e.to_string())?;
+    if cancel_reg.token.is_cancelled() {
+        lock_guard.suppress_followup_on_cancel();
+    }
+    let report = res.map_err(map_err)?;
     let _ = app.emit("profiles-updated", ());
     Ok(report)
 }
@@ -1864,6 +2229,7 @@ pub async fn sync_external_cmd(
                     "job-progress",
                     JobProgressEvent {
                         job_id: jid_p.clone(),
+                        job_kind: "external".into(),
                         stage: "external".into(),
                         message: msg.to_string(),
                         files_done: done,
@@ -1899,6 +2265,18 @@ pub async fn sync_external_cmd(
                 Ok(s)
             }
             Err(e) => {
+                if !cancel.is_cancelled() {
+                    let _ = db.update_external_freshness(
+                        &profile.id,
+                        false,
+                        false,
+                        "failed",
+                        Some(&e.to_string()),
+                        profile.pending_push_count,
+                        profile.pending_pull_count,
+                        profile.pending_bytes,
+                    );
+                }
                 let st = if cancel.is_cancelled() {
                     "cancelled"
                 } else {
@@ -2030,7 +2408,7 @@ pub async fn install_native_update(
     };
 
     let marker_path = state.paths.data_dir.join("post_update_relaunch");
-    let _ = std::fs::write(&marker_path, "1");
+    let marker_for_finish = marker_path.clone();
 
     let downloaded = Arc::new(AtomicU64::new(0));
     let last_emitted = Arc::new(AtomicU64::new(0));
@@ -2060,6 +2438,9 @@ pub async fn install_native_update(
                 }
             },
             move || {
+                // Write the one-shot relaunch marker ONLY once download finishes (right before
+                // installer handoff) so quitting mid-download never leaves a stale marker behind.
+                let _ = std::fs::write(&marker_for_finish, "1");
                 let _ = finish_app.emit(
                     "desktop-update-progress",
                     serde_json::json!({

@@ -155,6 +155,15 @@ export const GpxMapPreview: React.FC<{ plan: GeotagPlan }> = ({ plan }) => {
     };
 
     map.on('style.load', syncLayers);
+    const resizeObserver =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => {
+            if (el.offsetWidth > 0 && el.offsetHeight > 0) {
+              map.resize();
+            }
+          })
+        : null;
+    resizeObserver?.observe(el);
     map.on('error', (ev) => {
       // Only fall back to blank dark style when the base style itself fails to load (offline/unreachable)
       const isStyleFailure =
@@ -171,6 +180,7 @@ export const GpxMapPreview: React.FC<{ plan: GeotagPlan }> = ({ plan }) => {
     });
 
     return () => {
+      resizeObserver?.disconnect();
       map.remove();
       mapRef.current = null;
       loadedRef.current = false;

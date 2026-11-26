@@ -112,9 +112,11 @@ fn scan_dir(
         let Some(rel) = relative_normalized(root, p) else {
             continue;
         };
+        let lower_rel = rel.to_ascii_lowercase();
         if is_mac_metadata_path(&rel)
-            || rel.ends_with(".truongsync.part")
-            || rel.ends_with(".partial")
+            || lower_rel.ends_with(".truongsync.part")
+            || lower_rel.ends_with(".partial")
+            || lower_rel.ends_with("_exiftool_tmp")
             || (ignore_root_markers && is_timestamped_marker_filename(&rel))
         {
             ignored_mac += 1;
@@ -200,13 +202,22 @@ pub fn verify_external_profile_cancellable(
             pending_bytes: 0,
         });
     };
-    // Verify the resolved mount point is still present right before scanning
-    if !Path::new(&vol.mount_path).is_dir() {
+    // Verify the resolved mount point is still present and target path doesn't escape via symlink
+    let mount_path = Path::new(&vol.mount_path);
+    if !mount_path.is_dir() {
         return Err(anyhow!(
             "External drive '{}' disconnected before verification could scan it.",
             profile.volume_label
         ));
     }
+    if !ext_root.starts_with(mount_path) {
+        return Err(anyhow!(
+            "External backup destination '{}' escapes volume mount '{}'.",
+            ext_root.display(),
+            mount_path.display()
+        ));
+    }
+    crate::cloud::ensure_no_symlink_ancestors(mount_path, &ext_root)?;
     Ok(verify_external_roots_inner(
         profile,
         Path::new(&profile.local_root),
@@ -672,35 +683,62 @@ fn commit_part_file(part: &Path, dst: &Path, allow_overwrite: bool) -> Result<()
             use std::os::windows::ffi::OsStrExt;
             use windows::core::PCWSTR;
             use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
-            let src_w: Vec<u16> = part
-                .as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            let dst_w: Vec<u16> = dst
-                .as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            unsafe {
-                MoveFileExW(
-                    PCWSTR(src_w.as_ptr()),
-                    PCWSTR(dst_w.as_ptr()),
-                    MOVEFILE_WRITE_THROUGH,
-                )
+            let to_wide_verbatim = |p: &Path| -> Vec<u16> {
+                let s = p.to_string_lossy();
+                let formatted = if s.len() >= 240 && !s.starts_with(r"\\?\") {
+                    if let Some(unc) = s.strip_prefix(r"\\") {
+                        format!(r"\\?\UNC\{unc}")
+                    } else {
+                        format!(r"\\?\{s}")
+                    }
+                } else {
+                    s.into_owned()
+                };
+                std::ffi::OsStr::new(&formatted)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect()
+            };
+            let src_w = to_wide_verbatim(part);
+            let dst_w = to_wide_verbatim(dst);
+            let mut last_err = None;
+            for attempt in 0..4 {
+                match unsafe {
+                    MoveFileExW(
+                        PCWSTR(src_w.as_ptr()),
+                        PCWSTR(dst_w.as_ptr()),
+                        MOVEFILE_WRITE_THROUGH,
+                    )
+                } {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        // Retry briefly on Windows Defender / Explorer transient sharing/lock violations
+                        // (ERROR_ACCESS_DENIED = 5, ERROR_SHARING_VIOLATION = 32, ERROR_LOCK_VIOLATION = 33).
+                        let code = (e.code().0 as u32) & 0xFFFF;
+                        if matches!(code, 5 | 32 | 33) && attempt < 3 {
+                            last_err = Some(e);
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                120 * (attempt + 1),
+                            ));
+                            continue;
+                        }
+                        return Err(anyhow!(
+                            "Refusing to overwrite or move failed for {}: {e}",
+                            dst.display()
+                        ));
+                    }
+                }
             }
-            .map_err(|e| {
-                anyhow!(
-                    "Refusing to overwrite or move failed for {}: {e}",
-                    dst.display()
-                )
-            })?;
-            return Ok(());
+            return Err(anyhow!(
+                "Refusing to overwrite or move failed for {}: {:?}",
+                dst.display(),
+                last_err
+            ));
         }
     }
 
     // Verified GPS backfill replacement (`allow_overwrite == true`):
-    // Handle Windows read-only attribute & brief Defender/Explorer locks cleanly.
+    // Handle Windows read-only attribute & brief Defender/Explorer sharing locks cleanly.
     #[cfg(windows)]
     {
         if let Ok(meta) = std::fs::metadata(dst) {
@@ -713,12 +751,16 @@ fn commit_part_file(part: &Path, dst: &Path, allow_overwrite: bool) -> Result<()
             }
         }
         let mut last_err = None;
-        for attempt in 0..3 {
+        for attempt in 0..4 {
             match std::fs::rename(part, dst) {
                 Ok(()) => return Ok(()),
-                Err(e) if e.kind() == ErrorKind::PermissionDenied && attempt < 2 => {
+                Err(e)
+                    if (e.kind() == ErrorKind::PermissionDenied
+                        || matches!(e.raw_os_error(), Some(5 | 32 | 33)))
+                        && attempt < 3 =>
+                {
                     last_err = Some(e);
-                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    std::thread::sleep(std::time::Duration::from_millis(120 * (attempt + 1)));
                 }
                 Err(e) => {
                     return Err(e).with_context(|| {
@@ -742,8 +784,46 @@ fn commit_part_file(part: &Path, dst: &Path, allow_overwrite: bool) -> Result<()
     }
 }
 
-fn check_mount_device_identity(mount_check: Option<(&Path, Option<u64>)>) -> Result<()> {
-    let Some((mount_root, expected_dev)) = mount_check else {
+#[derive(Debug, Clone)]
+enum MountIdentity {
+    #[cfg(unix)]
+    UnixDev(u64),
+    #[cfg(windows)]
+    WindowsVolumeGuid(String),
+    #[cfg(not(any(unix, windows)))]
+    None,
+}
+
+#[cfg(windows)]
+fn query_windows_volume_guid(mount_root: &Path) -> Option<String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+
+    let mut s = mount_root.to_string_lossy().to_string();
+    if !s.ends_with('\\') && !s.ends_with('/') {
+        s.push('\\');
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(&s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut guid_buf = [0u16; 128];
+    unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(wide.as_ptr()), &mut guid_buf) }.ok()?;
+    let end = guid_buf
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(guid_buf.len());
+    let guid = OsString::from_wide(&guid_buf[..end])
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    (!guid.is_empty()).then_some(guid)
+}
+
+fn check_mount_device_identity(mount_check: Option<(&Path, Option<&MountIdentity>)>) -> Result<()> {
+    let Some((mount_root, expected_id)) = mount_check else {
         return Ok(());
     };
     let meta = std::fs::metadata(mount_root).map_err(|_| {
@@ -753,17 +833,38 @@ fn check_mount_device_identity(mount_check: Option<(&Path, Option<u64>)>) -> Res
         )
     })?;
     #[cfg(unix)]
-    if let Some(exp) = expected_dev {
+    if let Some(MountIdentity::UnixDev(exp)) = expected_id {
         use std::os::unix::fs::MetadataExt;
-        if meta.dev() != exp {
+        if meta.dev() != *exp {
             return Err(anyhow!(
                 "External drive device changed unexpectedly during sync ({}).",
                 mount_root.display()
             ));
         }
     }
-    #[cfg(not(unix))]
-    let _ = (meta, expected_dev);
+    #[cfg(windows)]
+    {
+        let _ = meta;
+        if let Some(MountIdentity::WindowsVolumeGuid(exp)) = expected_id {
+            match query_windows_volume_guid(mount_root) {
+                Some(cur) if cur.eq_ignore_ascii_case(exp) => {}
+                Some(_) => {
+                    return Err(anyhow!(
+                        "External drive volume identity changed unexpectedly during sync ({}).",
+                        mount_root.display()
+                    ));
+                }
+                None => {
+                    return Err(anyhow!(
+                        "External drive disconnected during sync ({}).",
+                        mount_root.display()
+                    ));
+                }
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (meta, expected_id);
     Ok(())
 }
 
@@ -879,8 +980,17 @@ where
             profile.volume_label
         ));
     };
-    // Verify the resolved mount point is still present and record expected device ID (Unix)
+    // Verify the resolved mount point is still present, does not escape via symlinks,
+    // and record expected device/volume identity (Unix dev_t / Windows volume GUID).
     let mount_path = PathBuf::from(&vol.mount_path);
+    if !ext_root.starts_with(&mount_path) {
+        return Err(anyhow!(
+            "External backup destination '{}' escapes volume mount '{}'.",
+            ext_root.display(),
+            mount_path.display()
+        ));
+    }
+    crate::cloud::ensure_no_symlink_ancestors(&mount_path, &ext_root)?;
     let mount_meta = std::fs::metadata(&mount_path).map_err(|_| {
         anyhow!(
             "External drive '{}' disconnected before sync could start.",
@@ -888,12 +998,17 @@ where
         )
     })?;
     #[cfg(unix)]
-    let expected_dev = {
+    let expected_identity = {
         use std::os::unix::fs::MetadataExt;
-        Some(mount_meta.dev())
+        Some(MountIdentity::UnixDev(mount_meta.dev()))
     };
-    #[cfg(not(unix))]
-    let expected_dev: Option<u64> = {
+    #[cfg(windows)]
+    let expected_identity = {
+        let _ = mount_meta;
+        query_windows_volume_guid(&mount_path).map(MountIdentity::WindowsVolumeGuid)
+    };
+    #[cfg(not(any(unix, windows)))]
+    let expected_identity: Option<MountIdentity> = {
         let _ = mount_meta;
         None
     };
@@ -902,7 +1017,7 @@ where
         profile,
         Path::new(&profile.local_root),
         &ext_root,
-        Some((&mount_path, expected_dev)),
+        Some((&mount_path, expected_identity.as_ref())),
         vol.writable,
         Some(vol.free_bytes),
         db,
@@ -950,7 +1065,7 @@ fn sync_external_roots_with_mount_guard<F>(
     profile: &ExternalProfile,
     local_root: &Path,
     ext_root: &Path,
-    mount_guard: Option<(&Path, Option<u64>)>,
+    mount_guard: Option<(&Path, Option<&MountIdentity>)>,
     ext_writable: bool,
     ext_free_bytes: Option<u64>,
     db: &DbHandle,
@@ -1056,6 +1171,11 @@ where
     let failures: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let succeeded_rels: Arc<Mutex<Vec<(String, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
     let applied_update_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // Use a child cancellation token for drive-disconnect aborts so we stop in-flight copies
+    // immediately WITHOUT poisoning the caller's `cancel` token (which would misreport
+    // disconnects as user cancellation and abort multi-drive pipelines).
+    let worker_cancel = cancel.child_token();
+    let disconnect_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let workers = settings.import_threads.clamp(1, 8);
     let pool = rayon::ThreadPoolBuilder::new()
@@ -1070,13 +1190,19 @@ where
     pool.install(|| {
         // Pass 1: External -> PC (strictly non-overwriting!)
         pulls.par_iter().for_each(|rel| {
-            if cancel.is_cancelled() {
+            if worker_cancel.is_cancelled() {
                 return;
             }
             if let Err(e) = check_mount_device_identity(mount_guard) {
                 pull_failures.fetch_add(1, Ordering::Relaxed);
-                failures.lock().push((rel.clone(), e.to_string()));
-                cancel.cancel();
+                let msg = e.to_string();
+                let mut d_err = disconnect_err.lock();
+                if d_err.is_none() {
+                    *d_err = Some(msg.clone());
+                }
+                drop(d_err);
+                failures.lock().push((rel.clone(), msg));
+                worker_cancel.cancel();
                 return;
             }
             let src = ext_map
@@ -1084,7 +1210,15 @@ where
                 .map(|e| e.abs_path.clone())
                 .unwrap_or_else(|| join_rel_path(ext_root, rel));
             let dst = join_rel_path(local_root, rel);
-            match atomic_copy_preserve_mtime(local_root, &src, &dst, false, None, None, cancel) {
+            match atomic_copy_preserve_mtime(
+                local_root,
+                &src,
+                &dst,
+                false,
+                None,
+                None,
+                &worker_cancel,
+            ) {
                 Ok(n) => {
                     pulled.fetch_add(1, Ordering::Relaxed);
                     succeeded_rels.lock().push((rel.clone(), dst));
@@ -1092,7 +1226,7 @@ where
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     on_progress(&format!("Pulling {rel}"), d, total_ops, b);
                 }
-                Err(e) if !cancel.is_cancelled() => {
+                Err(e) if !worker_cancel.is_cancelled() => {
                     pull_failures.fetch_add(1, Ordering::Relaxed);
                     failures.lock().push((rel.clone(), e.to_string()));
                 }
@@ -1102,13 +1236,19 @@ where
 
         // Pass 2: PC -> External (strictly non-overwriting!)
         pushes.par_iter().for_each(|rel| {
-            if cancel.is_cancelled() {
+            if worker_cancel.is_cancelled() {
                 return;
             }
             if let Err(e) = check_mount_device_identity(mount_guard) {
                 push_failures.fetch_add(1, Ordering::Relaxed);
-                failures.lock().push((rel.clone(), e.to_string()));
-                cancel.cancel();
+                let msg = e.to_string();
+                let mut d_err = disconnect_err.lock();
+                if d_err.is_none() {
+                    *d_err = Some(msg.clone());
+                }
+                drop(d_err);
+                failures.lock().push((rel.clone(), msg));
+                worker_cancel.cancel();
                 return;
             }
             let src = local_map
@@ -1116,7 +1256,15 @@ where
                 .map(|l| l.abs_path.clone())
                 .unwrap_or_else(|| join_rel_path(local_root, rel));
             let dst = join_rel_path(ext_root, rel);
-            match atomic_copy_preserve_mtime(ext_root, &src, &dst, false, None, None, cancel) {
+            match atomic_copy_preserve_mtime(
+                ext_root,
+                &src,
+                &dst,
+                false,
+                None,
+                None,
+                &worker_cancel,
+            ) {
                 Ok(n) => {
                     pushed.fetch_add(1, Ordering::Relaxed);
                     succeeded_rels.lock().push((rel.clone(), src));
@@ -1124,7 +1272,7 @@ where
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     on_progress(&format!("Copying {rel}"), d, total_ops, b);
                 }
-                Err(e) if !cancel.is_cancelled() => {
+                Err(e) if !worker_cancel.is_cancelled() => {
                     push_failures.fetch_add(1, Ordering::Relaxed);
                     failures.lock().push((rel.clone(), e.to_string()));
                 }
@@ -1134,13 +1282,19 @@ where
 
         // Pass 3: Safe GPS backfill updates (stream-hashes copied bytes == post_md5 & re-verifies ext pre_md5!)
         backfills.par_iter().for_each(|rel| {
-            if cancel.is_cancelled() {
+            if worker_cancel.is_cancelled() {
                 return;
             }
             if let Err(e) = check_mount_device_identity(mount_guard) {
                 push_failures.fetch_add(1, Ordering::Relaxed);
-                failures.lock().push((rel.clone(), e.to_string()));
-                cancel.cancel();
+                let msg = e.to_string();
+                let mut d_err = disconnect_err.lock();
+                if d_err.is_none() {
+                    *d_err = Some(msg.clone());
+                }
+                drop(d_err);
+                failures.lock().push((rel.clone(), msg));
+                worker_cancel.cancel();
                 return;
             }
             let src = local_map
@@ -1166,7 +1320,7 @@ where
                 true,
                 Some(post_md5.as_str()),
                 Some(pre_set),
-                cancel,
+                &worker_cancel,
             ) {
                 Ok(n) => {
                     backfilled.fetch_add(1, Ordering::Relaxed);
@@ -1176,7 +1330,7 @@ where
                     let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                     on_progress(&format!("Updating geotagged {rel}"), d, total_ops, b);
                 }
-                Err(e) if !cancel.is_cancelled() => {
+                Err(e) if !worker_cancel.is_cancelled() => {
                     push_failures.fetch_add(1, Ordering::Relaxed);
                     failures.lock().push((rel.clone(), e.to_string()));
                 }
@@ -1213,6 +1367,10 @@ where
     let applied_ids = applied_update_ids.lock().clone();
     if !applied_ids.is_empty() {
         let _ = db.mark_intentional_updates_applied(&applied_ids, "external", &profile.id);
+    }
+
+    if let Some(err_msg) = disconnect_err.lock().take() {
+        return Err(anyhow!(err_msg));
     }
 
     if cancel.is_cancelled() {

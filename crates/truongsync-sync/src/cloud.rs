@@ -492,15 +492,30 @@ fn join_remote_path(remote_root: &str, rel_raw: &str) -> String {
 pub(crate) fn join_rel_path(base: &Path, rel: &str) -> PathBuf {
     let mut out = base.to_path_buf();
     for seg in rel.split(['/', '\\']) {
-        if !seg.is_empty() && seg != "." && seg != ".." {
-            out.push(seg);
+        if seg.is_empty() || seg == "." || seg == ".." {
+            continue;
         }
+        // Reject Windows drive-prefix segments (`C:`, `D:`) which would replace `out` in `PathBuf::push`
+        let b = seg.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            continue;
+        }
+        if matches!(
+            Path::new(seg).components().next(),
+            Some(std::path::Component::Prefix(_)) | Some(std::path::Component::RootDir)
+        ) {
+            continue;
+        }
+        out.push(seg);
     }
     out
 }
 
 fn is_temp_partial_file(rel: &str) -> bool {
-    rel.ends_with(".truongsync.part") || rel.ends_with(".partial")
+    let lower = rel.to_ascii_lowercase();
+    lower.ends_with(".truongsync.part")
+        || lower.ends_with(".partial")
+        || lower.ends_with("_exiftool_tmp")
 }
 
 #[derive(Debug, Clone)]
@@ -1148,11 +1163,38 @@ fn fetch_single_remote_md5(
 }
 
 fn cleanup_cancelled_cloud_parts(local_root: &Path, paths: &[String]) {
+    // Rclone `--partial-suffix .truongsync.part` creates `<filename>.<rand8>.truongsync.part`,
+    // so scan each affected parent directory for matching partial files.
+    let mut by_parent: HashMap<PathBuf, Vec<String>> = HashMap::new();
     for raw in paths {
         let p = join_rel_path(local_root, raw);
-        let mut os = p.into_os_string();
-        os.push(".truongsync.part");
-        let _ = std::fs::remove_file(PathBuf::from(os));
+        let Some(leaf) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let parent = p.parent().unwrap_or(local_root).to_path_buf();
+        by_parent.entry(parent).or_default().push(leaf);
+    }
+    for (parent, leaves) in by_parent {
+        let Ok(rd) = std::fs::read_dir(&parent) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".truongsync.part") {
+                continue;
+            }
+            let matches_any = leaves.iter().any(|leaf| {
+                name == format!("{leaf}.truongsync.part")
+                    || (name.starts_with(leaf.as_str())
+                        && name.as_bytes().get(leaf.len()) == Some(&b'.'))
+            });
+            if matches_any {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 }
 

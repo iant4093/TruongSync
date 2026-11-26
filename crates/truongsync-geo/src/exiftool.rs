@@ -39,8 +39,89 @@ pub struct GeotagExecutionResult {
     pub tagged_count: usize,
     pub skipped_count: usize,
     pub failed_count: usize,
+    #[serde(default)]
+    pub cancelled: bool,
     pub updated_records: Vec<GeotagWriteRecord>,
     pub failures: Vec<(String, String)>,
+}
+
+/// On Windows, assigns a spawned ExifTool launcher process to a Job Object with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so dropping the guard terminates BOTH
+/// `exiftool.exe` and its child `exiftool_files\perl.exe` process tree cleanly.
+#[cfg(windows)]
+struct ChildJobGuard(Option<windows::Win32::Foundation::HANDLE>);
+
+#[cfg(windows)]
+impl ChildJobGuard {
+    fn attach(pid: u32) -> Self {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+
+        let Ok(job) = (unsafe { CreateJobObjectW(None, PCWSTR::null()) }) else {
+            return Self(None);
+        };
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        }
+        .is_err()
+        {
+            let _ = unsafe { CloseHandle(job) };
+            return Self(None);
+        }
+        let Ok(proc_handle) =
+            (unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) })
+        else {
+            let _ = unsafe { CloseHandle(job) };
+            return Self(None);
+        };
+        let assigned = unsafe { AssignProcessToJobObject(job, proc_handle) };
+        let _ = unsafe { CloseHandle(proc_handle) };
+        if assigned.is_err() {
+            let _ = unsafe { CloseHandle(job) };
+            return Self(None);
+        }
+        Self(Some(job))
+    }
+
+    fn terminate_and_close(&mut self) {
+        if let Some(job) = self.0.take() {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(job) };
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ChildJobGuard {
+    fn drop(&mut self) {
+        self.terminate_and_close();
+    }
+}
+
+#[cfg(not(windows))]
+struct ChildJobGuard;
+
+#[cfg(not(windows))]
+impl ChildJobGuard {
+    fn attach(_pid: u32) -> Self {
+        Self
+    }
+
+    fn terminate_and_close(&mut self) {}
 }
 
 fn new_exiftool_cmd(bin: &Path) -> Command {
@@ -58,21 +139,33 @@ fn new_exiftool_cmd(bin: &Path) -> Command {
 /// Strips Windows verbatim `\\?\` prefix returned by `std::fs::canonicalize()` because ExifTool's
 /// `IsPC()` path loop rewrites `\` to `/`, turning `\\?\C:\...` into invalid `//?/C:/...`.
 /// Paired with `-api WindowsLongPath=1` inside `-common_args`, ExifTool safely re-adds `\\?\` when needed.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn strip_windows_verbatim_str(s: &str) -> String {
+    if s.as_bytes()
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(br"\\?\UNC\"))
+    {
+        return format!(r"\\{}", &s[8..]);
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        let b = rest.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return rest.to_string();
+        }
+    }
+    s.to_string()
+}
+
 fn exiftool_safe_path_string(canon_path: &Path) -> String {
     let s = canon_path.to_string_lossy();
     #[cfg(windows)]
     {
-        if s.len() >= 8 && s[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
-            return format!(r"\\{}", &s[8..]);
-        }
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            let b = rest.as_bytes();
-            if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
-                return rest.to_string();
-            }
-        }
+        strip_windows_verbatim_str(&s)
     }
-    s.into_owned()
+    #[cfg(not(windows))]
+    {
+        s.into_owned()
+    }
 }
 
 /// Strictly verifies a path is a photo (never a video, even through a symlink).
@@ -181,12 +274,13 @@ pub fn check_exiftool(override_path: Option<&str>) -> ToolAvailability {
     };
     let version = (|| -> Option<String> {
         let mut child = new_exiftool_cmd(&bin)
-            .arg("-ver")
+            .args(["-config", "", "-ver"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
+        let mut job_guard = ChildJobGuard::attach(child.id());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match child.try_wait() {
@@ -203,6 +297,7 @@ pub fn check_exiftool(override_path: Option<&str>) -> ToolAvailability {
                 }
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
+                        job_guard.terminate_and_close();
                         let _ = child.kill();
                         let _ = child.wait();
                         return None;
@@ -238,16 +333,17 @@ pub fn compute_file_md5(path: &Path) -> Result<String> {
 }
 
 /// Writes matched GPS coordinates to RAW & JPEG photos in a single persistent
-/// `exiftool -stay_open True -@ - -common_args -charset filename=UTF8` session.
+/// `exiftool -config "" -stay_open True -@ - -common_args -charset filename=UTF8` session.
 ///
 /// Safety guarantees:
+/// - `-config ""` isolates ExifTool from user/CWD `.ExifTool_config` files (no `-q`/`-lang`/arbitrary Perl)
 /// - Hardcoded photo-only allowlist + video denylist + ExifTool strict `image/*` `-if` guard
+/// - Signed decimal coordinates (`lat`/`lon`) paired with `GPSLatitudeRef`/`GPSLongitudeRef` so BOTH
+///   EXIF unsigned rationals and any existing XMP-exif GPS tags preserve Western/Southern hemispheres
 /// - `-common_args -charset filename=UTF8` (+ `-api WindowsLongPath=1` on Windows) persisted across all files
-/// - Race-free stderr framing via `-echo4 {stderr_ready{seq}}` + mpsc channel (lossy UTF-8 safe)
-/// - Numbered `-execute{seq}` / `{ready{seq}}` synchronization (lossy UTF-8 safe)
-/// - Bounded child wait with `child.kill()` cleanup so cancelled/stalled batches never hang
+/// - Threaded stdout & stderr framing with live cancel polling + per-file timeout + Windows Job Object cleanup
 /// - ValueConv `-GPSAltitudeRef#={0|1}` so below-sea-level altitudes write accurately
-/// - Only records `updated_records` when `post_md5 != pre_md5`
+/// - Invokes `on_updated` immediately per file when `post_md5 != pre_md5` so backfill hashes survive crashes
 pub fn write_geotags_batch<F>(
     items: &[PhotoGpsMatch],
     exiftool_override: Option<&str>,
@@ -258,6 +354,30 @@ pub fn write_geotags_batch<F>(
 where
     F: Fn(usize, usize, &str),
 {
+    write_geotags_batch_with_hook(
+        items,
+        exiftool_override,
+        bump_mtime,
+        cancel,
+        on_progress,
+        |_| {},
+    )
+}
+
+pub fn write_geotags_batch_with_hook<F, U>(
+    items: &[PhotoGpsMatch],
+    exiftool_override: Option<&str>,
+    bump_mtime: bool,
+    cancel: &CancellationToken,
+    on_progress: F,
+    on_updated: U,
+) -> Result<GeotagExecutionResult>
+where
+    F: Fn(usize, usize, &str),
+    U: Fn(&GeotagWriteRecord),
+{
+    const PER_FILE_TIMEOUT: Duration = Duration::from_secs(120);
+
     let bin = resolve_exiftool_binary(exiftool_override).ok_or_else(|| {
         anyhow!("ExifTool was not found. Reinstall TruongSync or set ExifTool's path in Settings.")
     })?;
@@ -300,6 +420,7 @@ where
             tagged_count: 0,
             skipped_count,
             failed_count: failures.len(),
+            cancelled: cancel.is_cancelled(),
             updated_records: Vec::new(),
             failures,
         });
@@ -308,6 +429,8 @@ where
     let mut cmd = new_exiftool_cmd(&bin);
     #[allow(unused_mut)]
     let mut spawn_args = vec![
+        "-config",
+        "",
         "-stay_open",
         "True",
         "-@",
@@ -327,6 +450,7 @@ where
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn ExifTool at {}", bin.display()))?;
+    let mut job_guard = ChildJobGuard::attach(child.id());
     let mut stdin = child
         .stdin
         .take()
@@ -339,6 +463,32 @@ where
         .stderr
         .take()
         .ok_or_else(|| anyhow!("failed to open ExifTool stderr"))?;
+
+    // Dedicated stdout reader thread so the main loop can poll with timeouts and live cancellation.
+    let (stdout_tx, stdout_rx) = mpsc::channel::<Result<String, String>>();
+    let stdout_handle = std::thread::Builder::new()
+        .name("ts-exiftool-stdout".into())
+        .spawn(move || {
+            let mut r = BufReader::new(stdout);
+            let mut byte_buf = Vec::new();
+            loop {
+                byte_buf.clear();
+                match r.read_until(b'\n', &mut byte_buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let line = String::from_utf8_lossy(&byte_buf).trim().to_string();
+                        if stdout_tx.send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = stdout_tx.send(Err(e.to_string()));
+                        break;
+                    }
+                }
+            }
+        })
+        .ok();
 
     // Race-free stderr framing: ExifTool emits `{stderr_ready{seq}}` via `-echo4` right before `{ready{seq}}`.
     let (stderr_tx, stderr_rx) = mpsc::channel::<(usize, Vec<String>)>();
@@ -379,14 +529,14 @@ where
         })
         .ok();
 
-    let mut reader = BufReader::new(stdout);
-    let mut out_byte_buf = Vec::new();
     let mut updated_records = Vec::with_capacity(to_write.len());
     let total = to_write.len();
     let mut protocol_broken = false;
+    let mut was_cancelled = false;
 
     for (idx, item) in to_write.iter().enumerate() {
         if cancel.is_cancelled() {
+            was_cancelled = true;
             break;
         }
         let raw_path = Path::new(&item.path);
@@ -437,9 +587,11 @@ where
             "-if".to_string(),
             "defined $MIMEType and $MIMEType =~ /^image\\//i".to_string(),
             "-GPSMapDatum=WGS-84".to_string(),
-            format!("-GPSLatitude={:.7}", lat.abs()),
+            // Pass signed coordinates + explicit Ref tags: ExifTool strips the sign automatically
+            // for unsigned EXIF rationals while preserving W/S hemisphere for any existing XMP-exif tags.
+            format!("-GPSLatitude={lat:.7}"),
             format!("-GPSLatitudeRef={lat_ref}"),
-            format!("-GPSLongitude={:.7}", lon.abs()),
+            format!("-GPSLongitude={lon:.7}"),
             format!("-GPSLongitudeRef={lon_ref}"),
         ];
         if let Some(ele) = item.ele.filter(|v| v.is_finite()) {
@@ -491,26 +643,42 @@ where
         let expected_ready = format!("{{ready{seq}}}");
         let mut output_lines = Vec::new();
         let mut reached_ready = false;
+        let mut timed_out = false;
+        let file_deadline = Instant::now() + PER_FILE_TIMEOUT;
         loop {
-            out_byte_buf.clear();
-            match reader.read_until(b'\n', &mut out_byte_buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    let s = String::from_utf8_lossy(&out_byte_buf);
-                    let trimmed = s.trim();
-                    if trimmed == expected_ready {
+            if cancel.is_cancelled() {
+                was_cancelled = true;
+                protocol_broken = true;
+                break;
+            }
+            let remaining = file_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                timed_out = true;
+                protocol_broken = true;
+                break;
+            }
+            let wait_slice = remaining.min(Duration::from_millis(100));
+            match stdout_rx.recv_timeout(wait_slice) {
+                Ok(Ok(line)) => {
+                    if line == expected_ready {
                         reached_ready = true;
                         break;
                     }
-                    if !trimmed.is_empty() {
-                        output_lines.push(trimmed.to_string());
+                    if !line.is_empty() {
+                        output_lines.push(line);
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     output_lines.push(format!("read error: {e}"));
                     break;
                 }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+        }
+
+        if was_cancelled {
+            break;
         }
 
         // Wait briefly for the matching `{stderr_ready{seq}}` sentinel so stderr diagnostics are race-free
@@ -544,11 +712,13 @@ where
         if combined.contains("1 image files updated") {
             match compute_file_md5(&canon_path) {
                 Ok(post_md5) if post_md5 != pre_md5 => {
-                    updated_records.push(GeotagWriteRecord {
+                    let rec = GeotagWriteRecord {
                         path: item.path.clone(),
                         pre_md5,
                         post_md5,
-                    });
+                    };
+                    on_updated(&rec);
+                    updated_records.push(rec);
                 }
                 Ok(_) => {
                     skipped_count += 1;
@@ -560,11 +730,18 @@ where
         {
             skipped_count += 1;
         } else {
-            let detail = match (combined.is_empty(), errs.is_empty()) {
-                (false, false) => format!("{combined} ({errs})"),
-                (false, true) => combined,
-                (true, false) => errs,
-                (true, true) => "ExifTool did not confirm update".into(),
+            let detail = if timed_out {
+                format!(
+                    "ExifTool timed out after {}s while writing GPS metadata",
+                    PER_FILE_TIMEOUT.as_secs()
+                )
+            } else {
+                match (combined.is_empty(), errs.is_empty()) {
+                    (false, false) => format!("{combined} ({errs})"),
+                    (false, true) => combined,
+                    (true, false) => errs,
+                    (true, true) => "ExifTool did not confirm update".into(),
+                }
             };
             failures.push((item.path.clone(), detail));
             if !reached_ready {
@@ -582,12 +759,17 @@ where
         on_progress(idx + 1, total, &item.filename);
     }
 
-    // Drop stdout reader BEFORE waiting so ExifTool cannot block writing to a full stdout pipe
-    drop(reader);
+    // Drop channel receivers BEFORE waiting so ExifTool cannot block writing to a full pipe
+    drop(stdout_rx);
+    drop(stderr_rx);
+
+    let mut force_killed = false;
     if protocol_broken {
         drop(stdin);
+        job_guard.terminate_and_close();
         let _ = child.kill();
         let _ = child.wait();
+        force_killed = true;
     } else {
         let _ = stdin.write_all(b"-stay_open\nFalse\n");
         let _ = stdin.flush();
@@ -600,22 +782,53 @@ where
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 _ => {
+                    job_guard.terminate_and_close();
                     let _ = child.kill();
                     let _ = child.wait();
+                    force_killed = true;
                     break;
                 }
             }
         }
     }
-    if let Some(handle) = stderr_handle {
-        let _ = handle.join();
+    // Only join pipe reader threads on clean exit; after a force kill, detaching prevents
+    // any chance of hanging if an OS descendant briefly retained an inherited pipe handle.
+    if !force_killed {
+        if let Some(handle) = stdout_handle {
+            let _ = handle.join();
+        }
+        if let Some(handle) = stderr_handle {
+            let _ = handle.join();
+        }
     }
 
     Ok(GeotagExecutionResult {
         tagged_count: updated_records.len(),
         skipped_count,
         failed_count: failures.len(),
+        cancelled: was_cancelled || cancel.is_cancelled(),
         updated_records,
         failures,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_windows_verbatim_handles_non_ascii_at_byte_8() {
+        assert_eq!(
+            strip_windows_verbatim_str(r"\\?\D:\Ảnh\2026\IMG_0001.CR3"),
+            r"D:\Ảnh\2026\IMG_0001.CR3"
+        );
+        assert_eq!(
+            strip_windows_verbatim_str(r"\\?\C:\写真\IMG_0001.JPG"),
+            r"C:\写真\IMG_0001.JPG"
+        );
+        assert_eq!(
+            strip_windows_verbatim_str(r"\\?\UNC\server\share\Été.jpg"),
+            r"\\server\share\Été.jpg"
+        );
+    }
 }

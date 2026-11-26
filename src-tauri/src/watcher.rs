@@ -339,11 +339,6 @@ pub fn start_background_scheduler(app: AppHandle) {
                             _ => false,
                         };
                         if due && connected {
-                            if was_deferred {
-                                if let Some(st) = app.try_state::<AppState>() {
-                                    st.deferred_on_connect.lock().remove(&p.id);
-                                }
-                            }
                             let app_c = app.clone();
                             let pid = p.id.clone();
                             let do_sync = p.schedule_action == "sync";
@@ -358,6 +353,11 @@ pub fn start_background_scheduler(app: AppHandle) {
                                 .await;
                                 if ok {
                                     fail_map.lock().remove(&key);
+                                    if was_deferred {
+                                        if let Some(st) = app_c.try_state::<AppState>() {
+                                            st.deferred_on_connect.lock().remove(&pid);
+                                        }
+                                    }
                                     if mode == "daily" {
                                         d_done.lock().insert(key, today_c);
                                     }

@@ -156,6 +156,7 @@ pub fn run() {
             commands::preview_import_plan,
             commands::run_import_pipeline,
             commands::cancel_active_job,
+            commands::cancel_oauth,
             commands::find_matching_gpx,
             commands::preview_geotag,
             commands::run_geotag,

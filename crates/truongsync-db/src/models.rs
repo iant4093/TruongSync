@@ -290,7 +290,11 @@ pub struct JobItemRecord {
 
 fn normalize_abs_for_prefix(p: &Path) -> String {
     let raw = p.to_string_lossy();
-    let stripped = if raw.len() >= 8 && raw[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+    let stripped = if raw
+        .as_bytes()
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(br"\\?\UNC\"))
+    {
         format!(r"\\{}", &raw[8..])
     } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
         rest.to_string()
@@ -335,4 +339,25 @@ pub fn relative_normalized(root: &Path, full_path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_abs_handles_non_ascii_at_byte_8() {
+        assert_eq!(
+            normalize_abs_for_prefix(Path::new("/Users/Éric/Photos/IMG_0001.CR3")),
+            "/Users/Éric/Photos/IMG_0001.CR3"
+        );
+        assert_eq!(
+            normalize_abs_for_prefix(Path::new("/Users/写真/Photos")),
+            "/Users/写真/Photos"
+        );
+        assert_eq!(
+            normalize_abs_for_prefix(Path::new(r"\\?\UNC\server\share\Été")),
+            "//server/share/Été"
+        );
+    }
 }

@@ -194,6 +194,7 @@ export interface PipelineSummary {
   cloud_synced_profiles: number;
   external_synced_profiles: number;
   ejected: boolean;
+  cancelled?: boolean;
   stage_errors?: number;
   notes: string[];
 }
@@ -244,6 +245,7 @@ export interface GeotagExecutionResult {
   tagged_count: number;
   skipped_count: number;
   failed_count: number;
+  cancelled?: boolean;
   updated_records: { path: string; pre_md5: string; post_md5: string }[];
   failures: [string, string][];
 }
@@ -386,6 +388,7 @@ export interface JobItemRecord {
 
 export interface JobProgressEvent {
   job_id: string;
+  job_kind?: string;
   stage: string;
   message: string;
   files_done: number;

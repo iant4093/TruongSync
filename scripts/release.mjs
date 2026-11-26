@@ -20,12 +20,20 @@ const notesIdx = args.indexOf('--notes');
 const notes = notesIdx >= 0 ? args.splice(notesIdx, 2)[1] : '';
 
 const conf = JSON.parse(readFileSync(join(root, 'src-tauri', 'tauri.conf.json'), 'utf8'));
-const cfgIdx = args.indexOf('--config');
-const override = cfgIdx >= 0 && args[cfgIdx + 1]?.trim().startsWith('{') ? JSON.parse(args[cfgIdx + 1]) : {};
+const cfgIdx = args.indexOf('--config') >= 0 ? args.indexOf('--config') : args.indexOf('-c');
+let override = {};
+if (cfgIdx >= 0 && args[cfgIdx + 1]) {
+  const cfgArg = args[cfgIdx + 1].trim();
+  if (cfgArg.startsWith('{')) {
+    override = JSON.parse(cfgArg);
+  } else if (existsSync(resolve(root, cfgArg))) {
+    override = JSON.parse(readFileSync(resolve(root, cfgArg), 'utf8'));
+  }
+}
 const version = override.version ?? conf.version;
 const endpoint = override.plugins?.updater?.endpoints?.[0] ?? conf.plugins?.updater?.endpoints?.[0] ?? '';
 
-const targetIdx = args.indexOf('--target');
+const targetIdx = args.indexOf('--target') >= 0 ? args.indexOf('--target') : args.indexOf('-t');
 const targetTriple = targetIdx >= 0 ? args[targetIdx + 1] : null;
 
 // 1a. Fetch bundled rclone + ExifTool sidecars BEFORE loading the release signing private key
@@ -33,17 +41,21 @@ const sidecarEnv = { ...process.env };
 delete sidecarEnv.TAURI_SIGNING_PRIVATE_KEY;
 delete sidecarEnv.TAURI_SIGNING_PRIVATE_KEY_PATH;
 delete sidecarEnv.TAURI_SIGNING_PRIVATE_KEY_PASSWORD;
-const fetchSidecars = spawnSync(process.execPath, [join(root, 'scripts', 'fetch-sidecars.mjs')], {
+const sidecarArgs = [join(root, 'scripts', 'fetch-sidecars.mjs')];
+if (targetTriple) {
+  sidecarArgs.push('--target', targetTriple);
+}
+const fetchSidecars = spawnSync(process.execPath, sidecarArgs, {
   cwd: root,
   env: sidecarEnv,
   stdio: 'inherit',
 });
 if (fetchSidecars.status !== 0) process.exit(fetchSidecars.status ?? 1);
 
-// 1b. Signing key for updater artifacts
+// 1b. Signing key for updater artifacts (respects either TAURI_SIGNING_PRIVATE_KEY or TAURI_SIGNING_PRIVATE_KEY_PATH)
 const env = { ...process.env };
 env.TS_BUILD_VERSION ??= version;
-if (!env.TAURI_SIGNING_PRIVATE_KEY) {
+if (!env.TAURI_SIGNING_PRIVATE_KEY && !env.TAURI_SIGNING_PRIVATE_KEY_PATH) {
   const keyFile = join(homedir(), '.tauri', 'truongsync.key');
   if (!existsSync(keyFile)) {
     console.error('[release] No signing key. Run: npx tauri signer generate -w ~/.tauri/truongsync.key');
