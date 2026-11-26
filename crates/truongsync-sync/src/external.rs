@@ -706,6 +706,8 @@ fn commit_part_file(part: &Path, dst: &Path, allow_overwrite: bool) -> Result<()
         if let Ok(meta) = std::fs::metadata(dst) {
             let mut perms = meta.permissions();
             if perms.readonly() {
+                // Windows-only: clears FILE_ATTRIBUTE_READONLY (does not affect Unix permissions).
+                #[allow(clippy::permissions_set_readonly_false)]
                 perms.set_readonly(false);
                 let _ = std::fs::set_permissions(dst, perms);
             }
@@ -725,12 +727,12 @@ fn commit_part_file(part: &Path, dst: &Path, allow_overwrite: bool) -> Result<()
                 }
             }
         }
-        return Err(anyhow!(
+        Err(anyhow!(
             "rename failed {} -> {}: {:?}",
             part.display(),
             dst.display(),
             last_err
-        ));
+        ))
     }
     #[cfg(not(windows))]
     {
