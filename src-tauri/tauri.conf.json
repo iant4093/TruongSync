@@ -42,7 +42,7 @@
   },
   "plugins": {
     "shell": {
-      "open": "https?://[A-Za-z0-9\\-._~\\[\\]:/?#@!$&'()*+,;=%]+"
+      "open": "https://github\\.com/iant4093/TruongSync(?:/[A-Za-z0-9\\-._~/%#?=&]*)?"
     },
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE1M0FBQTJDMUZBRTUwQkIKUldTN1VLNGZMS282RmVjMDVxb3IvcWJiMjZEcXBmMXNBNDVkb2hpaXFZZFB2NXJtZUxGaUFVT1gK",

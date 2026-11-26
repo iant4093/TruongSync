@@ -132,9 +132,12 @@ export const DriveBackupView: React.FC = () => {
     setProfileBusy(profile.id, 'sync');
     try {
       const res = await api.syncExternal(profile.id, restoreMode);
-      notifySuccess(
-        `${restoreMode ? 'Restored' : 'Synced'} "${profile.name}": ↑${res.pushed_count} pushed, ↓${res.pulled_count} pulled (${formatBytes(res.bytes_transferred)}).`,
-      );
+      const summary = `${restoreMode ? 'Restored' : 'Synced'} "${profile.name}": ↑${res.pushed_count} pushed, ↓${res.pulled_count} pulled (${formatBytes(res.bytes_transferred)})`;
+      if (res.failed_count > 0) {
+        notifyError(`${summary} — ${res.failed_count} file(s) failed (see Activity for details).`);
+      } else {
+        notifySuccess(`${summary}.`);
+      }
       setReports((prev) => {
         const next = { ...prev };
         delete next[profile.id];
@@ -225,7 +228,7 @@ export const DriveBackupView: React.FC = () => {
                     className="button"
                     onClick={async () => {
                       const d = await pickDirectory('Choose Local Library Root');
-                      if (d) setEditing({ ...editing, local_root: d });
+                      if (d) setEditing((prev) => (prev ? { ...prev, local_root: d } : prev));
                     }}
                   >
                     Browse
@@ -346,9 +349,13 @@ export const DriveBackupView: React.FC = () => {
                   type="number"
                   className="text-input"
                   min={1}
+                  step={1}
                   value={editing.stale_after_days}
                   onChange={(e) =>
-                    setEditing({ ...editing, stale_after_days: Math.max(1, Number(e.target.value) || 14) })
+                    setEditing({
+                      ...editing,
+                      stale_after_days: Math.max(1, Math.trunc(Number(e.target.value) || 14)),
+                    })
                   }
                 />
               </div>

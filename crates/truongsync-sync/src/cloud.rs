@@ -48,6 +48,7 @@ pub struct CloudSyncResult {
     pub downloaded_count: usize,
     pub uploaded_count: usize,
     pub backfill_replaced_count: usize,
+    pub failed_count: usize,
     pub conflicts_count: usize,
     pub skipped_tombstones: usize,
     pub duration_ms: u64,
@@ -280,7 +281,8 @@ fn enforce_private_conf_perms(conf_path: &Path) {
 }
 
 /// Safely copies an existing `rclone.conf` into TruongSync's managed config path
-/// (guards against self-copy truncation, validates at least one remote section, writes via 0600 temp file).
+/// (guards against self-copy truncation, enforces 1 MiB size cap, validates all remote section names,
+/// writes via 0600 temp file).
 pub fn import_rclone_config(source_conf: &Path, managed_conf: &Path) -> Result<Vec<String>> {
     if !source_conf.is_file() {
         return Err(anyhow!(
@@ -288,7 +290,26 @@ pub fn import_rclone_config(source_conf: &Path, managed_conf: &Path) -> Result<V
             source_conf.display()
         ));
     }
-    let remotes = parse_remote_names_from_conf(source_conf);
+    let meta = std::fs::metadata(source_conf)?;
+    if meta.len() > 1024 * 1024 {
+        return Err(anyhow!(
+            "Selected rclone.conf exceeds maximum allowed size (1 MiB)."
+        ));
+    }
+    let contents = std::fs::read(source_conf)?;
+    let txt = std::str::from_utf8(&contents)
+        .map_err(|_| anyhow!("Selected rclone.conf is not valid UTF-8 INI text."))?;
+    let mut remotes = Vec::new();
+    for line in txt.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') && t.len() > 2 {
+            let raw_name = &t[1..t.len() - 1];
+            let valid = validate_rclone_remote_name(raw_name).map_err(|e| {
+                anyhow!("Invalid remote section '[{raw_name}]' in rclone.conf: {e}")
+            })?;
+            remotes.push(valid);
+        }
+    }
     if remotes.is_empty() {
         return Err(anyhow!(
             "Selected file does not contain any valid [remote] sections."
@@ -307,7 +328,6 @@ pub fn import_rclone_config(source_conf: &Path, managed_conf: &Path) -> Result<V
         .parent()
         .ok_or_else(|| anyhow!("Invalid managed rclone.conf path"))?;
     std::fs::create_dir_all(parent)?;
-    let contents = std::fs::read(source_conf)?;
 
     let mut tmp = NamedTempFile::new_in(parent)?;
     enforce_private_conf_perms(tmp.path());
@@ -324,6 +344,12 @@ pub fn list_rclone_remotes(managed_conf: &Path) -> Vec<String> {
 }
 
 fn parse_remote_names_from_conf(conf_path: &Path) -> Vec<String> {
+    let Ok(meta) = std::fs::metadata(conf_path) else {
+        return Vec::new();
+    };
+    if meta.len() > 1024 * 1024 {
+        return Vec::new();
+    }
     let Ok(txt) = std::fs::read_to_string(conf_path) else {
         return Vec::new();
     };
@@ -331,12 +357,22 @@ fn parse_remote_names_from_conf(conf_path: &Path) -> Vec<String> {
         .filter_map(|line| {
             let t = line.trim();
             if t.starts_with('[') && t.ends_with(']') && t.len() > 2 {
-                Some(t[1..t.len() - 1].to_string())
+                validate_rclone_remote_name(&t[1..t.len() - 1]).ok()
             } else {
                 None
             }
         })
         .collect()
+}
+
+fn validate_oauth_param(label: &str, value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('-') || trimmed.chars().any(|c| c.is_control()) {
+        return Err(anyhow!(
+            "Invalid {label}: cannot start with '-' or contain control characters."
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Launches `rclone config create <remote_name> drive scope drive config_is_local=true` with a
@@ -355,11 +391,21 @@ pub fn connect_google_drive_oauth(
     if let Some(parent) = managed_conf.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Pre-create managed_conf with 0600 permissions BEFORE spawning rclone so tokens are never world-readable.
+    if !managed_conf.exists() {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(managed_conf);
+    }
+    enforce_private_conf_perms(managed_conf);
+
     let clean_name = validate_rclone_remote_name(remote_name)?;
     let mut cmd = new_rclone_cmd(&bin);
     cmd.arg("--config").arg(managed_conf).args([
         "config",
         "create",
+        "--",
         &clean_name,
         "drive",
         "scope",
@@ -368,13 +414,16 @@ pub fn connect_google_drive_oauth(
         "true",
     ]);
     if let Some(cid) = client_id.filter(|s| !s.trim().is_empty()) {
-        cmd.args(["client_id", cid.trim()]);
+        let clean_cid = validate_oauth_param("Google OAuth Client ID", cid)?;
+        cmd.args(["client_id", &clean_cid]);
     }
     if let Some(csec) = client_secret.filter(|s| !s.trim().is_empty()) {
-        cmd.args(["client_secret", csec.trim()]);
+        let clean_csec = validate_oauth_param("Google OAuth Client Secret", csec)?;
+        cmd.args(["client_secret", &clean_csec]);
     }
-    let out = run_rclone_cancellable_with_timeout(cmd, cancel, Some(Duration::from_secs(300)))?;
+    let res = run_rclone_cancellable_with_timeout(cmd, cancel, Some(Duration::from_secs(300)));
     enforce_private_conf_perms(managed_conf);
+    let out = res?;
     if !out.success {
         return Err(anyhow!(
             "Google Drive sign-in failed: {}",
@@ -384,15 +433,51 @@ pub fn connect_google_drive_oauth(
     Ok(parse_remote_names_from_conf(managed_conf))
 }
 
-fn remote_spec(profile: &CloudProfile) -> String {
-    let rname = profile.remote_name.trim().trim_end_matches(':');
+fn remote_spec(profile: &CloudProfile) -> Result<String> {
+    let rname = validate_rclone_remote_name(&profile.remote_name)?;
     let rpath = profile
         .remote_path
         .replace('\\', "/")
         .trim()
         .trim_matches('/')
         .to_string();
-    format!("{rname}:{rpath}")
+    Ok(format!("{rname}:{rpath}"))
+}
+
+/// Validates that no existing ancestor directory between `root` and `dst` (inclusive of `dst`'s parent)
+/// is a symlink/reparse point, preventing symlink-traversal escapes outside sync roots.
+pub(crate) fn ensure_no_symlink_ancestors(root: &Path, dst: &Path) -> Result<()> {
+    let Ok(rel) = dst.strip_prefix(root) else {
+        return Err(anyhow!(
+            "Refusing sync target outside root: {}",
+            dst.display()
+        ));
+    };
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        use std::path::Component;
+        match comp {
+            Component::Normal(seg) => {
+                cur.push(seg);
+                if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+                    if meta.file_type().is_symlink() {
+                        return Err(anyhow!(
+                            "Refusing to traverse symlink inside sync root: {}",
+                            cur.display()
+                        ));
+                    }
+                }
+            }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "Invalid traversal component in sync path: {}",
+                    dst.display()
+                ));
+            }
+            Component::CurDir => {}
+        }
+    }
+    Ok(())
 }
 
 fn join_remote_path(remote_root: &str, rel_raw: &str) -> String {
@@ -519,13 +604,14 @@ fn list_remote_tree(
     let mut cmd = new_rclone_cmd(bin);
     cmd.arg("--config").arg(managed_conf).args([
         "lsjson",
-        remote,
         "--recursive",
         "--files-only",
         "--hash-type",
         "MD5",
         "--no-mimetype",
         "--drive-skip-gdocs",
+        "--",
+        remote,
     ]);
     let out = run_rclone_cancellable(cmd, cancel)?;
 
@@ -679,10 +765,16 @@ fn verify_cloud_inner(
         ));
     }
 
-    let local_root = Path::new(&profile.local_root);
+    let local_root = Path::new(profile.local_root.trim());
+    if !local_root.is_absolute() {
+        return Err(anyhow!(
+            "Cloud profile local root must be an absolute path: {}",
+            profile.local_root
+        ));
+    }
     let (local_map, local_exact_dups, local_mac) =
         scan_local_tree(local_root, !restore_mode, cancel)?;
-    let remote = remote_spec(profile);
+    let remote = remote_spec(profile)?;
     let (remote_map, duplicate_remote_paths, remote_mac, remote_root_exists) =
         list_remote_tree(&bin, managed_conf, &remote, cancel)?;
 
@@ -1026,6 +1118,44 @@ fn ensure_local_root_for_sync(local_root: &Path, restore_mode: bool) -> Result<(
     Ok(())
 }
 
+fn fetch_single_remote_md5(
+    bin: &Path,
+    managed_conf: &Path,
+    remote_file: &str,
+    cancel: &CancellationToken,
+) -> Result<Option<String>> {
+    let mut cmd = new_rclone_cmd(bin);
+    cmd.arg("--config").arg(managed_conf).args([
+        "lsjson",
+        "--stat",
+        "--hash",
+        "--hash-type",
+        "MD5",
+        "--no-mimetype",
+        "--drive-skip-gdocs",
+        "--",
+        remote_file,
+    ]);
+    let out = run_rclone_cancellable(cmd, cancel)?;
+    if !out.success {
+        return Ok(None);
+    }
+    let entry: RcloneLsEntry = serde_json::from_slice(&out.stdout)?;
+    Ok(entry
+        .hashes
+        .and_then(|h| h.get("md5").or_else(|| h.get("MD5")).cloned())
+        .map(|s| s.to_ascii_lowercase()))
+}
+
+fn cleanup_cancelled_cloud_parts(local_root: &Path, paths: &[String]) {
+    for raw in paths {
+        let p = join_rel_path(local_root, raw);
+        let mut os = p.into_os_string();
+        os.push(".truongsync.part");
+        let _ = std::fs::remove_file(PathBuf::from(os));
+    }
+}
+
 /// Runs 2-way strictly-additive Google Drive sync (or Restore/Hydrate when `restore_mode` is true):
 /// 0. Safely replaces verified GPS-backfilled photos (`--checksum`, TOCTOU MD5 re-check, per-target applied)
 /// 1. Pass 1 (`Drive → Local`): downloads brand-new Drive files (or all missing files in restore mode)
@@ -1052,7 +1182,13 @@ where
             "Google Drive is not connected yet. Connect Google Drive or import rclone.conf first."
         ));
     }
-    let local_root = Path::new(&profile.local_root);
+    let local_root = Path::new(profile.local_root.trim());
+    if !local_root.is_absolute() {
+        return Err(anyhow!(
+            "Cloud profile local root must be an absolute path: {}",
+            profile.local_root
+        ));
+    }
     ensure_local_root_for_sync(local_root, restore_mode)?;
 
     on_progress("Auditing Local ↔ Google Drive…", 0, 100);
@@ -1071,7 +1207,7 @@ where
         return Err(anyhow!("Sync cancelled."));
     }
 
-    let remote = remote_spec(profile);
+    let remote = remote_spec(profile)?;
     let bwlimit = settings
         .bandwidth_limit_mbps
         .filter(|&v| v.is_finite() && v > 0.0)
@@ -1105,11 +1241,11 @@ where
                 backfill_failed += 1;
                 continue;
             };
-            let Some((ids, _, post_md5)) = ctx.intentional_by_rel.get(&item.rel_path) else {
+            let Some((ids, pre_set, post_md5)) = ctx.intentional_by_rel.get(&item.rel_path) else {
                 backfill_failed += 1;
                 continue;
             };
-            // Re-verify local file still matches expected post_md5 (TOCTOU guard)
+            // Re-verify local file still matches expected post_md5 (local TOCTOU guard)
             let cur_md5 = match compute_file_md5(&loc_meta.abs_path) {
                 Ok(h) if h.eq_ignore_ascii_case(post_md5) => h,
                 Ok(_) => {
@@ -1131,6 +1267,27 @@ where
             };
 
             let remote_file = join_remote_path(&remote, &rem_meta.raw_path);
+            // Re-verify live remote MD5 immediately before replacing (remote TOCTOU guard)
+            match fetch_single_remote_md5(&bin, managed_conf, &remote_file, cancel)? {
+                Some(live_md5) if pre_set.contains(&live_md5) => {}
+                Some(_) => {
+                    backfill_failed += 1;
+                    notes.push(format!(
+                        "Skipped GPS backfill for {}: remote Drive copy changed since scan",
+                        item.rel_path
+                    ));
+                    continue;
+                }
+                None => {
+                    backfill_failed += 1;
+                    notes.push(format!(
+                        "Skipped GPS backfill for {}: could not re-verify remote Drive MD5",
+                        item.rel_path
+                    ));
+                    continue;
+                }
+            }
+
             let mut cmd = new_rclone_cmd(&bin);
             cmd.arg("--config").arg(managed_conf).args([
                 "copyto",
@@ -1144,7 +1301,7 @@ where
             if let Some(ref bw) = bwlimit {
                 cmd.args(["--bwlimit", bw]);
             }
-            cmd.arg(&loc_meta.abs_path).arg(&remote_file);
+            cmd.arg("--").arg(&loc_meta.abs_path).arg(&remote_file);
             let out = run_rclone_cancellable(cmd, cancel)?;
             if out.success {
                 backfill_replaced += 1;
@@ -1199,15 +1356,26 @@ where
             1,
             2,
         );
-        // Partition newline-containing paths (unsafe for --files-from-raw) into single copyto calls
+        // Partition newline-containing paths (unsafe for --files-from-raw) into single copyto calls,
+        // and reject any destination path traversing an existing local directory symlink!
         let mut batch_dl: Vec<(&SyncDiffItem, &str)> = Vec::new();
         let mut single_dl: Vec<(&SyncDiffItem, &str)> = Vec::new();
+        let mut safe_dl_items: Vec<&SyncDiffItem> = Vec::new();
+        let mut all_dl_raws: Vec<String> = Vec::new();
         for item in &download_list {
             let raw = ctx
                 .remote_map
                 .get(&item.rel_path)
                 .map(|m| m.raw_path.as_str())
                 .unwrap_or(item.rel_path.as_str());
+            let target_local = join_rel_path(local_root, raw);
+            if let Err(err) = ensure_no_symlink_ancestors(local_root, &target_local) {
+                download_failed += 1;
+                notes.push(format!("Blocked unsafe download {}: {err}", item.rel_path));
+                continue;
+            }
+            safe_dl_items.push(item);
+            all_dl_raws.push(raw.to_string());
             if raw.contains('\n') || raw.contains('\r') {
                 single_dl.push((item, raw));
             } else {
@@ -1215,6 +1383,7 @@ where
             }
         }
 
+        let mut dl_had_errors = false;
         if !batch_dl.is_empty() {
             let mut manifest_file = NamedTempFile::new()?;
             for (_, raw) in &batch_dl {
@@ -1227,8 +1396,6 @@ where
                 .arg(managed_conf)
                 .args([
                     "copy",
-                    &remote,
-                    &profile.local_root,
                     "--immutable",
                     "--partial-suffix",
                     ".truongsync.part",
@@ -1251,8 +1418,16 @@ where
             if let Some(ref bw) = bwlimit {
                 cmd.args(["--bwlimit", bw]);
             }
-            let out = run_rclone_cancellable(cmd, cancel)?;
+            cmd.arg("--").arg(&remote).arg(local_root);
+            let out = match run_rclone_cancellable(cmd, cancel) {
+                Ok(o) => o,
+                Err(e) => {
+                    cleanup_cancelled_cloud_parts(local_root, &all_dl_raws);
+                    return Err(e);
+                }
+            };
             if !out.success {
+                dl_had_errors = true;
                 let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
                 notes.push(format!("Drive-to-PC pass reported errors: {err}"));
             }
@@ -1260,6 +1435,7 @@ where
 
         for (item, raw) in single_dl {
             if cancel.is_cancelled() {
+                cleanup_cancelled_cloud_parts(local_root, &all_dl_raws);
                 return Err(anyhow!("Sync cancelled."));
             }
             let rfile = join_remote_path(&remote, raw);
@@ -1275,9 +1451,16 @@ where
             if let Some(ref bw) = bwlimit {
                 cmd.args(["--bwlimit", bw]);
             }
-            cmd.arg(&rfile).arg(&lfile);
-            let out = run_rclone_cancellable(cmd, cancel)?;
+            cmd.arg("--").arg(&rfile).arg(&lfile);
+            let out = match run_rclone_cancellable(cmd, cancel) {
+                Ok(o) => o,
+                Err(e) => {
+                    cleanup_cancelled_cloud_parts(local_root, &all_dl_raws);
+                    return Err(e);
+                }
+            };
             if !out.success {
+                dl_had_errors = true;
                 notes.push(format!(
                     "Download failed for {}: {}",
                     item.rel_path,
@@ -1286,9 +1469,10 @@ where
             }
         }
 
-        // Verify which downloaded files actually exist on disk with expected size before recording manifest
+        // Verify which downloaded files actually exist as regular files with expected size
+        // (and matching MD5 when rclone reported errors, so failed --immutable downloads never pass!).
         let mut dl_entries = Vec::new();
-        for item in &download_list {
+        for item in &safe_dl_items {
             let raw = ctx
                 .remote_map
                 .get(&item.rel_path)
@@ -1296,9 +1480,37 @@ where
                 .unwrap_or(item.rel_path.as_str());
             let p_raw = join_rel_path(local_root, raw);
             let p_norm = join_rel_path(local_root, &item.rel_path);
-            let meta = std::fs::metadata(&p_raw).or_else(|_| std::fs::metadata(&p_norm));
-            match meta {
-                Ok(m) if item.remote_bytes.is_none_or(|rb| m.len() == rb) => {
+            let found = if p_raw.is_file() {
+                let m = std::fs::metadata(&p_raw);
+                Some((p_raw, m))
+            } else if p_norm.is_file() {
+                let m = std::fs::metadata(&p_norm);
+                Some((p_norm, m))
+            } else {
+                None
+            };
+            let r_md5 = ctx
+                .remote_map
+                .get(&item.rel_path)
+                .and_then(|rm| rm.md5.clone());
+            match found {
+                Some((path, Ok(m)))
+                    if m.is_file() && item.remote_bytes.is_none_or(|rb| m.len() == rb) =>
+                {
+                    let md5_ok = if dl_had_errors {
+                        match r_md5.as_deref() {
+                            Some(expected) => compute_file_md5(&path)
+                                .map(|actual| actual.eq_ignore_ascii_case(expected))
+                                .unwrap_or(false),
+                            None => false,
+                        }
+                    } else {
+                        true
+                    };
+                    if !md5_ok {
+                        download_failed += 1;
+                        continue;
+                    }
                     downloaded_count += 1;
                     let mtime = m
                         .modified()
@@ -1306,10 +1518,6 @@ where
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
-                    let r_md5 = ctx
-                        .remote_map
-                        .get(&item.rel_path)
-                        .and_then(|rm| rm.md5.clone());
                     dl_entries.push(ManifestEntry {
                         profile_kind: "cloud".into(),
                         profile_id: profile.id.clone(),
@@ -1369,13 +1577,7 @@ where
             let mut cmd = new_rclone_cmd(&bin);
             cmd.arg("--config")
                 .arg(managed_conf)
-                .args([
-                    "copy",
-                    &profile.local_root,
-                    &remote,
-                    "--immutable",
-                    "--files-from-raw",
-                ])
+                .args(["copy", "--immutable", "--files-from-raw"])
                 .arg(ul_manifest.path())
                 .args([
                     "--drive-skip-gdocs",
@@ -1394,6 +1596,7 @@ where
             if let Some(ref bw) = bwlimit {
                 cmd.args(["--bwlimit", bw]);
             }
+            cmd.arg("--").arg(local_root).arg(&remote);
             let out = run_rclone_cancellable(cmd, cancel)?;
             if !out.success {
                 batch_ok = false;
@@ -1443,7 +1646,7 @@ where
                 if let Some(ref bw) = bwlimit {
                     cmd.args(["--bwlimit", bw]);
                 }
-                cmd.arg(&loc_meta.abs_path).arg(&rfile);
+                cmd.arg("--").arg(&loc_meta.abs_path).arg(&rfile);
                 let out = run_rclone_cancellable(cmd, cancel)?;
                 if out.success {
                     uploaded_count += 1;
@@ -1526,6 +1729,7 @@ where
         downloaded_count,
         uploaded_count,
         backfill_replaced_count: backfill_replaced,
+        failed_count: total_failures,
         conflicts_count: report.conflicts.len(),
         skipped_tombstones: if restore_mode {
             0

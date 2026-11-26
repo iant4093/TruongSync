@@ -1,11 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { listen } from '@tauri-apps/api/event';
 import { enable as enableAutostart, disable as disableAutostart, isEnabled as isAutostartEnabled } from '@tauri-apps/plugin-autostart';
 import { Download, ExternalLink, FolderOpen, RefreshCw, Save } from 'lucide-react';
 import { api, formatBytes, isTauri, openExternalUrl, pickDirectory } from '../../lib/tauri';
-import { notifyError, notifyInfo, notifySuccess } from '../../store/feedback';
+import { notifyError, notifySuccess } from '../../store/feedback';
 import { useSyncStore } from '../../store/useSyncStore';
-import type { AppSettings, UpdateDownloadProgress, UpdateFeedStatus } from '../../types/api';
+import type { AppSettings } from '../../types/api';
 import { Badge, SectionTitle, ToggleRow, ViewHeader } from '../ui';
 
 const RELEASES_URL = 'https://github.com/iant4093/TruongSync/releases';
@@ -17,6 +16,12 @@ export const SettingsView: React.FC = () => {
   const refreshSettings = useSyncStore((s) => s.refreshSettings);
   const refreshTools = useSyncStore((s) => s.refreshTools);
   const refreshProfiles = useSyncStore((s) => s.refreshProfiles);
+  const checkingUpdates = useSyncStore((s) => s.checkingUpdates);
+  const updateStatus = useSyncStore((s) => s.updateStatus);
+  const installingUpdate = useSyncStore((s) => s.installingUpdate);
+  const updateProgress = useSyncStore((s) => s.updateProgress);
+  const checkForUpdates = useSyncStore((s) => s.checkForUpdates);
+  const installUpdate = useSyncStore((s) => s.installUpdate);
 
   const [draft, setDraft] = useState<AppSettings | null>(settings);
   const [categoriesText, setCategoriesText] = useState('');
@@ -24,11 +29,9 @@ export const SettingsView: React.FC = () => {
   const [threadsText, setThreadsText] = useState('8');
   const [staleDaysText, setStaleDaysText] = useState('7');
   const [autostart, setAutostart] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  const [osAutoLaunchBusy, setOsAutoLaunchBusy] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [checkingUpdates, setCheckingUpdates] = useState(false);
-  const [updateStatus, setUpdateStatus] = useState<UpdateFeedStatus | null>(null);
-  const [installingUpdate, setInstallingUpdate] = useState(false);
-  const [updateProgress, setUpdateProgress] = useState<UpdateDownloadProgress | null>(null);
   const dirtyRef = useRef(false);
 
   const updateDraft = (patch: Partial<AppSettings>) => {
@@ -126,6 +129,8 @@ export const SettingsView: React.FC = () => {
   };
 
   const handleAutostartToggle = async (next: boolean) => {
+    if (autostartBusy) return;
+    setAutostartBusy(true);
     try {
       if (next) await enableAutostart();
       else await disableAutostart();
@@ -133,10 +138,14 @@ export const SettingsView: React.FC = () => {
       notifySuccess(next ? 'TruongSync will start in the tray at login.' : 'Launch at login disabled.');
     } catch (err) {
       notifyError(err, 'Could not update launch at login');
+    } finally {
+      setAutostartBusy(false);
     }
   };
 
   const handleOsNativeAutoLaunch = async (next: boolean) => {
+    if (osAutoLaunchBusy) return;
+    setOsAutoLaunchBusy(true);
     try {
       const msg = await api.setOsNativeAutoLaunch(next);
       setDraft((prev) => (prev ? { ...prev, os_native_auto_launch: next } : prev));
@@ -144,50 +153,8 @@ export const SettingsView: React.FC = () => {
       notifySuccess(msg);
     } catch (err) {
       notifyError(err, 'Could not toggle OS-native auto-launch');
-    }
-  };
-
-  const handleCheckUpdates = async () => {
-    if (!isTauri()) {
-      notifyInfo('Updates are checked inside the TruongSync desktop app.');
-      return;
-    }
-    setCheckingUpdates(true);
-    try {
-      const status = await api.checkUpdateFeed();
-      setUpdateStatus(status);
-      if (status.available && status.version) {
-        notifySuccess(`Signed update v${status.version} is ready to install.`);
-      } else if (status.notes) {
-        notifyInfo(status.notes);
-      } else {
-        notifyInfo(`TruongSync v${bootstrap?.version ?? '0.1.0'} is up to date.`);
-      }
-    } catch (err) {
-      notifyError(err, 'Update check failed');
     } finally {
-      setCheckingUpdates(false);
-    }
-  };
-
-  const handleInstallUpdate = async () => {
-    if (!updateStatus?.available || installingUpdate) return;
-    setInstallingUpdate(true);
-    setUpdateProgress({ downloaded: 0, total: null, finished: false });
-    let unlisten: (() => void) | null = null;
-    try {
-      if (isTauri()) {
-        unlisten = await listen<UpdateDownloadProgress>('desktop-update-progress', (ev) => {
-          setUpdateProgress(ev.payload);
-        });
-      }
-      await api.installNativeUpdate();
-    } catch (err) {
-      notifyError(err, 'Could not install update');
-      setInstallingUpdate(false);
-      setUpdateProgress(null);
-    } finally {
-      unlisten?.();
+      setOsAutoLaunchBusy(false);
     }
   };
 
@@ -490,7 +457,11 @@ export const SettingsView: React.FC = () => {
               <button
                 type="button"
                 className="button"
-                onClick={() => void openExternalUrl(RELEASES_URL)}
+                onClick={() =>
+                  void openExternalUrl(RELEASES_URL).catch((err) =>
+                    notifyError(err, 'Could not open GitHub Releases'),
+                  )
+                }
               >
                 <ExternalLink size={14} /> GitHub Releases
               </button>
@@ -498,7 +469,7 @@ export const SettingsView: React.FC = () => {
                 type="button"
                 className="button button-primary"
                 disabled={checkingUpdates || installingUpdate}
-                onClick={() => void handleCheckUpdates()}
+                onClick={() => void checkForUpdates()}
               >
                 <RefreshCw size={14} /> {checkingUpdates ? 'Checking…' : 'Check for Updates'}
               </button>
@@ -518,7 +489,7 @@ export const SettingsView: React.FC = () => {
                       type="button"
                       className="button button-primary"
                       disabled={installingUpdate}
-                      onClick={() => void handleInstallUpdate()}
+                      onClick={() => void installUpdate()}
                     >
                       <Download size={14} />{' '}
                       {installingUpdate

@@ -8,7 +8,8 @@ import { Badge, EmptyState, SectionTitle, SegmentedControl, ViewHeader } from '.
 
 export const ActivityView: React.FC = () => {
   const jobs = useSyncStore((s) => s.jobs);
-  const activeProgress = useSyncStore((s) => s.activeProgress);
+  const activeJobs = useSyncStore((s) => s.activeJobs);
+  const activeJobList = Object.values(activeJobs);
   const refreshJobs = useSyncStore((s) => s.refreshJobs);
   const inspectorJobId = useSyncStore((s) => s.inspectorJobId);
   const setInspectorJobId = useSyncStore((s) => s.setInspectorJobId);
@@ -34,24 +35,24 @@ export const ActivityView: React.FC = () => {
         }
       />
 
-      {activeProgress && (
-        <div className="card" style={{ marginBottom: 16 }}>
+      {activeJobList.map((prog) => (
+        <div key={prog.job_id} className="card" style={{ marginBottom: 16 }}>
           <div className="card-body stack">
             <div className="row-between">
               <div className="row">
-                <Badge tone="info">{activeProgress.stage.toUpperCase()}</Badge>
-                <strong>{activeProgress.message}</strong>
+                <Badge tone="info">{prog.stage.toUpperCase()}</Badge>
+                <strong>{prog.message}</strong>
               </div>
               <span className="mono muted tabular">
-                {activeProgress.speed_bps > 0 ? `${formatBytes(activeProgress.speed_bps)}/s` : ''}
+                {prog.speed_bps > 0 ? `${formatBytes(prog.speed_bps)}/s` : ''}
               </span>
             </div>
             <div className="upload-progress-bar">
               <div
                 style={{
                   width: `${
-                    activeProgress.files_total > 0
-                      ? Math.min(100, (activeProgress.files_done / activeProgress.files_total) * 100)
+                    prog.files_total > 0
+                      ? Math.min(100, (prog.files_done / prog.files_total) * 100)
                       : 20
                   }%`,
                 }}
@@ -59,19 +60,19 @@ export const ActivityView: React.FC = () => {
             </div>
             <div className="row-between">
               <span className="muted tabular">
-                {activeProgress.files_done} / {activeProgress.files_total}
+                {prog.files_done} / {prog.files_total}
               </span>
               <button
                 type="button"
                 className="button button-danger"
-                onClick={() => void api.cancelActiveJob(activeProgress.job_id)}
+                onClick={() => void api.cancelActiveJob(prog.job_id)}
               >
                 Cancel Job
               </button>
             </div>
           </div>
         </div>
-      )}
+      ))}
 
       <div className="row-between" style={{ marginBottom: 12 }}>
         <SegmentedControl
@@ -165,7 +166,7 @@ export const JobInspectorDrawer: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [inspectorJobId]);
+  }, [inspectorJobId, selectedJob?.status, selectedJob?.files_done, selectedJob?.files_failed]);
 
   useEffect(() => {
     if (!selectedJob) return;

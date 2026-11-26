@@ -41,7 +41,7 @@ export const App: React.FC = () => {
     void init();
     if (isTauri()) {
       ensureWindowStateWatcher();
-      if (!nativeMacTitlebar) {
+      if (windowsCaption) {
         document.documentElement.classList.add('tauri-frameless');
         document.body.classList.add('tauri-transparent');
       }

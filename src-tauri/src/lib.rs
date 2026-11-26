@@ -22,16 +22,26 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     paths.ensure_dirs()?;
     let db = DbHandle::open(&paths.db_path)?;
 
-    let initial_vol = std::env::args()
-        .skip_while(|a| a != "--import-volume")
-        .nth(1)
-        .map(|v| auto_launch::normalize_import_volume_arg(&v))
-        .filter(|v| !v.is_empty());
+    // Consume one-shot post-update relaunch marker so stale `--autostart` / `--import-volume` CLI
+    // args replayed by macOS `open -n` or Windows NSIS `/ARGS` do not hide the window or re-scan old drives.
+    let post_update_marker = paths.data_dir.join("post_update_relaunch");
+    let post_update_relaunch = std::fs::remove_file(&post_update_marker).is_ok();
+
+    let initial_vol = if post_update_relaunch {
+        None
+    } else {
+        std::env::args()
+            .skip_while(|a| a != "--import-volume")
+            .nth(1)
+            .map(|v| auto_launch::normalize_import_volume_arg(&v))
+            .filter(|v| !v.is_empty())
+    };
 
     let state = commands::AppState::new(db, paths, initial_vol);
     app.manage(state);
 
-    let autostart_launch = std::env::args().any(|arg| arg == AUTOSTART_ARG);
+    let autostart_launch =
+        !post_update_relaunch && std::env::args().any(|arg| arg == AUTOSTART_ARG);
     let main_url = tauri::WebviewUrl::App("index.html".into());
 
     let builder = tauri::WebviewWindowBuilder::new(app, "main", main_url)
@@ -60,6 +70,13 @@ fn setup_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(target_os = "macos")]
             if main_win.is_fullscreen().unwrap_or(false) {
                 let _ = main_win.set_fullscreen(false);
+                // Wait briefly for macOS fullscreen Space exit transition before hiding window
+                let win_later = main_win.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(650));
+                    let _ = win_later.hide();
+                });
+                return;
             }
             let _ = main_win.hide();
         }
@@ -98,6 +115,9 @@ pub fn run() {
                 if let Some(vol_raw) = args.get(pos + 1) {
                     let vol = auto_launch::normalize_import_volume_arg(vol_raw);
                     if !vol.is_empty() {
+                        if let Some(st) = app.try_state::<commands::AppState>() {
+                            st.set_initial_import_volume_if_unbootstrapped(vol.clone());
+                        }
                         tray::show_main_window(app);
                         let _ = app.emit("navigate-tab", "import");
                         let _ = app.emit("auto-import-volume-path", vol);

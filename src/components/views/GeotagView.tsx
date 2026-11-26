@@ -87,7 +87,7 @@ export const GeotagView: React.FC = () => {
     setResult(null);
     try {
       const next = await api.previewGeotag({
-        targetPaths: [targetFolder],
+        targetPaths: [targetFolder.trim()],
         gpxFiles,
         clockOffsetSecs,
         maxGapSecs: Math.max(60, maxGapMins * 60),
@@ -118,6 +118,12 @@ export const GeotagView: React.FC = () => {
     try {
       const res = await api.runGeotag(plan.items, recordBackfill);
       setResult(res);
+      // Invalidate the preview plan after writing so clicking Write GPS again cannot double-tag
+      // or overwrite backfill pre_md5 hashes with already-tagged file hashes.
+      if (res.tagged_count > 0) {
+        setPlan(null);
+        setPreviewSignature(null);
+      }
       if (res.failed_count > 0) {
         notifyError(
           `Geotagging finished with ${res.failed_count} failure(s) (${res.tagged_count} photo(s) tagged).`,

@@ -60,10 +60,13 @@ pub fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
                 });
             }
             "quit" => {
-                if let Some(state) = app.try_state::<crate::commands::AppState>() {
-                    state.cancel_all_active();
-                }
-                app.exit(0);
+                let app_quit = app.clone();
+                std::thread::spawn(move || {
+                    if let Some(state) = app_quit.try_state::<crate::commands::AppState>() {
+                        state.cancel_all_and_wait(std::time::Duration::from_secs(2));
+                    }
+                    app_quit.exit(0);
+                });
             }
             _ => {}
         })

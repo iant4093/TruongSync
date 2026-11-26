@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use models::*;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -36,6 +36,20 @@ impl DbHandle {
         handle.ensure_defaults()?;
         handle.recover_stale_running_jobs()?;
         Ok(handle)
+    }
+
+    /// Opens an existing SQLite database strictly read-only without running migrations,
+    /// default seeding, or stale-job recovery (safe for short-lived LaunchAgent helpers).
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("failed to open SQLite db read-only at {}", path.display()))?;
+        let _ = conn.pragma_update(None, "busy_timeout", 2000);
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     fn recover_stale_running_jobs(&self) -> Result<()> {
@@ -150,7 +164,7 @@ impl DbHandle {
                 transfer_mode = ?8,
                 eject_after = ?9,
                 updated_at = ?10
-             WHERE id = 'default-photo-dump' OR is_default = 1",
+             WHERE id = 'default-photo-dump'",
             params![
                 settings.default_import_root,
                 settings.folder_template,

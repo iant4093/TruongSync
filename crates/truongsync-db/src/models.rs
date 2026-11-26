@@ -290,8 +290,8 @@ pub struct JobItemRecord {
 
 fn normalize_abs_for_prefix(p: &Path) -> String {
     let raw = p.to_string_lossy();
-    let stripped = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
+    let stripped = if raw.len() >= 8 && raw[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+        format!(r"\\{}", &raw[8..])
     } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
         rest.to_string()
     } else {

@@ -326,7 +326,7 @@ pub fn scan_media_source(source: &Path, settings: &AppSettings) -> Result<CardSc
                 }
                 let p = entry.path();
                 let rel = p
-                    .strip_prefix(source)
+                    .strip_prefix(&walk_root)
                     .unwrap_or(p)
                     .to_string_lossy()
                     .to_string();
@@ -454,8 +454,10 @@ pub fn run_preflight_checks(
 
     let required_bytes = scan.total_bytes;
     let safety_buffer_bytes = (required_bytes / 20).clamp(1_073_741_824, 10_737_418_240);
-    let dest_free_res = if !dest_root.as_os_str().is_empty() {
-        Some(disk_free_bytes(dest_root))
+    let dest_trimmed = dest_root.to_string_lossy().trim().to_string();
+    let dest_path = PathBuf::from(&dest_trimmed);
+    let dest_free_res = if !dest_trimmed.is_empty() && dest_path.is_absolute() {
+        Some(disk_free_bytes(&dest_path))
     } else {
         None
     };
@@ -469,6 +471,14 @@ pub fn run_preflight_checks(
     if is_move && !source_writable {
         blockers.push(
             "SD card appears write-protected (read-only). Unlock the physical SD switch or switch to Copy mode."
+                .into(),
+        );
+    }
+    if !dest_trimmed.is_empty() && !dest_path.is_absolute() {
+        blockers.push("Destination library root folder must be an absolute path.".into());
+    } else if !dest_trimmed.is_empty() && is_filesystem_readonly(&dest_path) == Some(true) {
+        blockers.push(
+            "Destination library drive is mounted read-only (for example, an NTFS drive on macOS). Choose a writable drive."
                 .into(),
         );
     }
@@ -559,8 +569,15 @@ pub fn build_import_plan(
     video_folder: &str,
     assignments: &[ShootAssignment],
 ) -> Result<Vec<ImportPlanItem>> {
-    if dest_root.as_os_str().is_empty() {
+    let dest_trimmed = dest_root.to_string_lossy().trim().to_string();
+    if dest_trimmed.is_empty() {
         return Err(anyhow!("Destination library root folder cannot be empty."));
+    }
+    let dest_root = Path::new(&dest_trimmed);
+    if !dest_root.is_absolute() {
+        return Err(anyhow!(
+            "Destination library root folder must be an absolute path."
+        ));
     }
     if assignments.is_empty() {
         return Err(anyhow!("At least one shoot assignment is required."));
@@ -605,10 +622,7 @@ pub fn build_import_plan(
         let folder_date = NaiveDate::parse_from_str(a.folder_date.trim(), "%Y-%m-%d")
             .or_else(|_| NaiveDate::parse_from_str(fallback_date_str, "%Y-%m-%d"))
             .unwrap_or_else(|_| Local::now().date_naive());
-        let safe_filename = Path::new(&f.filename)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .filter(|n| !n.is_empty() && n != "." && n != "..")
+        let safe_filename = crate::template::sanitize_filename(&f.filename)
             .ok_or_else(|| anyhow!("Invalid media filename '{}'", f.filename))?;
         let type_folder = match f.kind {
             MediaKind::Raw => raw_folder,
@@ -915,13 +929,29 @@ fn is_same_file_path(a: &Path, b: &Path) -> bool {
     false
 }
 
-fn hash_file_blake3(path: &Path, cancel: &CancellationToken) -> Result<blake3::Hash> {
+#[cfg(unix)]
+static EXFAT_RENAME_LOCK: Mutex<()> = Mutex::new(());
+
+fn hash_file_blake3(
+    path: &Path,
+    cancel: &CancellationToken,
+    bypass_cache: bool,
+) -> Result<Option<blake3::Hash>> {
     let mut file = File::open(path)?;
+    #[cfg(target_os = "macos")]
+    if bypass_cache {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            let _ = libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = bypass_cache;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 2 * 1024 * 1024];
     loop {
         if cancel.is_cancelled() {
-            return Err(anyhow!("Import cancelled during checksum verification."));
+            return Ok(None);
         }
         match file.read(&mut buf) {
             Ok(0) => break,
@@ -932,7 +962,7 @@ fn hash_file_blake3(path: &Path, cancel: &CancellationToken) -> Result<blake3::H
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(hasher.finalize())
+    Ok(Some(hasher.finalize()))
 }
 
 fn normalize_reservation_key(p: &Path) -> String {
@@ -1021,6 +1051,7 @@ fn atomic_place_no_overwrite(part_path: &Path, final_dst: &Path) -> Result<bool>
                     || raw == libc::EINVAL
                     || raw == libc::EPERM
                 {
+                    let _rename_guard = EXFAT_RENAME_LOCK.lock();
                     if final_dst.symlink_metadata().is_ok() {
                         return Ok(false);
                     }
@@ -1072,17 +1103,36 @@ fn atomic_place_no_overwrite(part_path: &Path, final_dst: &Path) -> Result<bool>
     }
 }
 
-fn sync_parent_dir(path: &Path) {
+fn sync_parent_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
+        let dir = File::open(parent).with_context(|| {
+            format!(
+                "failed to open destination directory {} for durability sync",
+                parent.display()
+            )
+        })?;
+        if let Err(err) = dir.sync_all() {
+            let raw = err.raw_os_error().unwrap_or(0);
+            if raw != libc::EINVAL
+                && raw != libc::ENOTSUP
+                && raw != libc::EOPNOTSUPP
+                && raw != libc::EBADF
+            {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to flush destination directory {} before removing source",
+                        parent.display()
+                    )
+                });
+            }
         }
     }
     #[cfg(not(unix))]
     {
         let _ = path;
     }
+    Ok(())
 }
 
 fn transfer_single_file(
@@ -1106,7 +1156,13 @@ fn transfer_single_file(
     if let Ok(dst_meta) = std::fs::metadata(dst) {
         if dst_meta.is_file() && dst_meta.len() == src_len {
             let same = if deep_verify || src_len > 0 {
-                hash_file_blake3(src, cancel)? == hash_file_blake3(dst, cancel)?
+                let Some(src_h) = hash_file_blake3(src, cancel, false)? else {
+                    return Ok(SingleOutcome::Cancelled);
+                };
+                let Some(dst_h) = hash_file_blake3(dst, cancel, false)? else {
+                    return Ok(SingleOutcome::Cancelled);
+                };
+                src_h == dst_h
             } else {
                 true
             };
@@ -1171,7 +1227,9 @@ fn transfer_single_file(
     }
 
     if let Some(expected_hash) = src_hasher.map(|h| h.finalize()) {
-        let actual_hash = hash_file_blake3(&part_path, cancel)?;
+        let Some(actual_hash) = hash_file_blake3(&part_path, cancel, true)? else {
+            return Ok(SingleOutcome::Cancelled);
+        };
         if actual_hash != expected_hash {
             return Err(anyhow!(
                 "blake3 checksum mismatch on destination for {}",
@@ -1205,7 +1263,7 @@ fn transfer_single_file(
     }
 
     if is_move {
-        sync_parent_dir(&final_dst);
+        sync_parent_dir(&final_dst)?;
         if is_same_file_path(src, &final_dst) {
             return Err(anyhow!(
                 "refusing to delete source because source and destination resolve to the same file"

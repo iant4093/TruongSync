@@ -31,7 +31,8 @@ use truongsync_sync::cloud::{
     CloudSyncResult, CloudVerifyReport,
 };
 use truongsync_sync::external::{
-    sync_external_profile, verify_external_profile, ExternalSyncResult, ExternalVerifyReport,
+    sync_external_profile, verify_external_profile_cancellable, ExternalSyncResult,
+    ExternalVerifyReport,
 };
 
 use crate::power::{is_on_battery, SleepGuard};
@@ -39,15 +40,25 @@ use crate::tray::show_main_window;
 
 static CANCEL_SEQ: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct FollowupSpec {
-    pub do_sync: bool,
+    pub normal_sync: bool,
     pub restore_mode: bool,
 }
 
 impl FollowupSpec {
+    pub fn from_sync(do_sync: bool, restore_mode: bool) -> Option<Self> {
+        if !do_sync {
+            return None;
+        }
+        Some(Self {
+            normal_sync: !restore_mode,
+            restore_mode,
+        })
+    }
+
     fn merge(&mut self, other: FollowupSpec) {
-        self.do_sync |= other.do_sync;
+        self.normal_sync |= other.normal_sync;
         self.restore_mode |= other.restore_mode;
     }
 }
@@ -65,8 +76,8 @@ struct ProfileLockTable {
 }
 
 /// RAII guard that guarantees per-profile locks are NEVER leaked on early error or panic,
-/// and automatically triggers a coalesced follow-up pass preserving exact `(do_sync, restore_mode)`
-/// unless the user explicitly cancelled the run.
+/// and automatically triggers coalesced follow-up passes (running Restore and Normal Sync
+/// sequentially when both were requested) unless the user explicitly cancelled the run.
 pub struct ProfileLockGuard {
     table: Arc<Mutex<ProfileLockTable>>,
     kind: LockKind,
@@ -97,26 +108,36 @@ impl Drop for ProfileLockGuard {
             tauri::async_runtime::spawn(async move {
                 match kind {
                     LockKind::Cloud => {
-                        let _ = run_locked_cloud_sync_background(
-                            &app,
-                            &pid,
-                            spec.do_sync,
-                            spec.restore_mode,
-                        )
-                        .await;
+                        if spec.restore_mode {
+                            let _ = run_locked_cloud_sync_background(&app, &pid, true, true).await;
+                        }
+                        if spec.normal_sync {
+                            let _ = run_locked_cloud_sync_background(&app, &pid, true, false).await;
+                        }
                     }
                     LockKind::External => {
-                        let _ = run_locked_external_sync_background(
-                            &app,
-                            &pid,
-                            spec.do_sync,
-                            spec.restore_mode,
-                        )
-                        .await;
+                        if spec.restore_mode {
+                            let _ =
+                                run_locked_external_sync_background(&app, &pid, true, true).await;
+                        }
+                        if spec.normal_sync {
+                            let _ =
+                                run_locked_external_sync_background(&app, &pid, true, false).await;
+                        }
                     }
                 }
             });
         }
+    }
+}
+
+pub struct FlagLockGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for FlagLockGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
     }
 }
 
@@ -137,6 +158,10 @@ pub struct AppState {
     pub db: DbHandle,
     pub paths: StoragePaths,
     pub initial_import_volume: Mutex<Option<String>>,
+    bootstrapped: AtomicBool,
+    import_running: Arc<AtomicBool>,
+    update_running: Arc<AtomicBool>,
+    pub deferred_on_connect: Mutex<HashSet<String>>,
     active_cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
     cloud_locks: Arc<Mutex<ProfileLockTable>>,
     external_locks: Arc<Mutex<ProfileLockTable>>,
@@ -148,9 +173,70 @@ impl AppState {
             db,
             paths,
             initial_import_volume: Mutex::new(initial_import_volume),
+            bootstrapped: AtomicBool::new(false),
+            import_running: Arc::new(AtomicBool::new(false)),
+            update_running: Arc::new(AtomicBool::new(false)),
+            deferred_on_connect: Mutex::new(HashSet::new()),
             active_cancels: Arc::new(Mutex::new(HashMap::new())),
             cloud_locks: Arc::new(Mutex::new(ProfileLockTable::default())),
             external_locks: Arc::new(Mutex::new(ProfileLockTable::default())),
+        }
+    }
+
+    pub fn set_initial_import_volume_if_unbootstrapped(&self, vol: String) {
+        if !self.bootstrapped.load(Ordering::SeqCst) {
+            *self.initial_import_volume.lock() = Some(vol);
+        }
+    }
+
+    pub fn try_lock_import(&self) -> Option<FlagLockGuard> {
+        if self
+            .import_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Some(FlagLockGuard {
+                flag: Arc::clone(&self.import_running),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn try_lock_update(&self) -> Option<FlagLockGuard> {
+        if self
+            .update_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Some(FlagLockGuard {
+                flag: Arc::clone(&self.update_running),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn is_cloud_locked(&self, profile_id: &str) -> bool {
+        self.cloud_locks.lock().active.contains(profile_id)
+    }
+
+    pub fn is_external_locked(&self, profile_id: &str) -> bool {
+        self.external_locks.lock().active.contains(profile_id)
+    }
+
+    /// Cancels all active jobs and waits up to `timeout` for child processes (`rclone`/`exiftool`)
+    /// and blocking workers to observe cancellation and release file locks before exit/update.
+    pub fn cancel_all_and_wait(&self, timeout: std::time::Duration) {
+        if !self.cancel_all_active() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if self.active_cancels.lock().is_empty() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 
@@ -267,14 +353,7 @@ pub async fn run_locked_cloud_sync_background(
     let Some(state) = app.try_state::<AppState>() else {
         return false;
     };
-    let followup = if do_sync {
-        Some(FollowupSpec {
-            do_sync: true,
-            restore_mode,
-        })
-    } else {
-        None
-    };
+    let followup = FollowupSpec::from_sync(do_sync, restore_mode);
     let Some(lock_guard) = state.try_lock_cloud(profile_id, Some(app.clone()), followup) else {
         return false;
     };
@@ -338,7 +417,7 @@ pub async fn run_locked_cloud_sync_background(
                     if let Some(ref jid) = job_id {
                         let _ = db.finish_job(
                             jid,
-                            if s.conflicts_count > 0 {
+                            if s.failed_count > 0 || s.conflicts_count > 0 {
                                 "partial"
                             } else {
                                 "succeeded"
@@ -346,15 +425,27 @@ pub async fn run_locked_cloud_sync_background(
                             (s.uploaded_count + s.downloaded_count + s.backfill_replaced_count)
                                 as i64,
                             s.skipped_tombstones as i64,
-                            s.conflicts_count as i64,
+                            (s.failed_count + s.conflicts_count) as i64,
                             0,
                             serde_json::to_string(&s).ok().as_deref(),
                             None,
                         );
                     }
-                    true
+                    s.failed_count == 0
                 }
                 Err(e) => {
+                    if !cancel.is_cancelled() {
+                        let _ = db.update_cloud_freshness(
+                            &pid,
+                            false,
+                            false,
+                            "failed",
+                            Some(&e.to_string()),
+                            profile.pending_upload_count,
+                            profile.pending_download_count,
+                            profile.pending_bytes,
+                        );
+                    }
                     if let Some(ref jid) = job_id {
                         let st = if cancel.is_cancelled() {
                             "cancelled"
@@ -402,14 +493,7 @@ pub async fn run_locked_external_sync_background(
     let Some(state) = app.try_state::<AppState>() else {
         return false;
     };
-    let followup = if do_sync {
-        Some(FollowupSpec {
-            do_sync: true,
-            restore_mode,
-        })
-    } else {
-        None
-    };
+    let followup = FollowupSpec::from_sync(do_sync, restore_mode);
     let Some(lock_guard) = state.try_lock_external(profile_id, Some(app.clone()), followup) else {
         return false;
     };
@@ -483,6 +567,18 @@ pub async fn run_locked_external_sync_background(
                     s.failed_count == 0
                 }
                 Err(e) => {
+                    if !cancel.is_cancelled() {
+                        let _ = db.update_external_freshness(
+                            &pid,
+                            false,
+                            false,
+                            "failed",
+                            Some(&e.to_string()),
+                            profile.pending_push_count,
+                            profile.pending_pull_count,
+                            profile.pending_bytes,
+                        );
+                    }
                     if let Some(ref jid) = job_id {
                         let st = if cancel.is_cancelled() {
                             "cancelled"
@@ -498,7 +594,9 @@ pub async fn run_locked_external_sync_background(
             let _ = app_clone.emit("jobs-updated", job_id);
             succeeded
         } else {
-            let ok = verify_external_profile(&profile, &db, false).is_ok();
+            let ok = verify_external_profile_cancellable(&profile, &db, false, &cancel)
+                .map(|r| r.volume_connected)
+                .unwrap_or(false);
             let _ = app_clone.emit("profiles-updated", ());
             ok
         }
@@ -614,6 +712,7 @@ fn map_err(err: anyhow::Error) -> String {
 
 #[tauri::command]
 pub fn get_bootstrap_info(app: AppHandle, state: State<'_, AppState>) -> BootstrapInfo {
+    state.bootstrapped.store(true, Ordering::SeqCst);
     // Take once so React StrictMode / reload never re-triggers initial auto-import forever
     let initial_vol = state.initial_import_volume.lock().take();
     BootstrapInfo {
@@ -723,15 +822,19 @@ pub fn list_year_categories(
     year: i32,
     create_if_missing: bool,
 ) -> Result<Vec<String>, String> {
-    if base_root.trim().is_empty() {
-        return Err("Base library root path is required.".into());
+    let root_trim = base_root.trim();
+    if root_trim.is_empty() || !Path::new(root_trim).is_absolute() {
+        return Err("Base library root must be an absolute directory path.".into());
     }
     if !(1970..=2100).contains(&year) {
         return Err("Year must be between 1970 and 2100.".into());
     }
+    if create_if_missing {
+        truongsync_ingest::volumes::disk_free_bytes(Path::new(root_trim)).map_err(map_err)?;
+    }
     let settings = state.db.load_settings().map_err(map_err)?;
     list_or_init_year_categories(
-        Path::new(base_root.trim()),
+        Path::new(root_trim),
         year,
         &settings.default_categories,
         create_if_missing,
@@ -752,6 +855,7 @@ pub fn create_category_folder(
     if !(1970..=2100).contains(&year) {
         return Err("Year must be between 1970 and 2100.".into());
     }
+    truongsync_ingest::volumes::disk_free_bytes(Path::new(root_trim)).map_err(map_err)?;
     let clean = sanitize_segment(&category);
     let target = Path::new(root_trim).join(format!("{year:04}")).join(&clean);
     std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
@@ -764,7 +868,29 @@ pub fn list_import_presets(state: State<'_, AppState>) -> Result<Vec<ImportPrese
 }
 
 #[tauri::command]
-pub fn save_import_preset(state: State<'_, AppState>, preset: ImportPreset) -> Result<(), String> {
+pub fn save_import_preset(
+    state: State<'_, AppState>,
+    mut preset: ImportPreset,
+) -> Result<(), String> {
+    preset.name = preset.name.trim().to_string();
+    preset.root_path = preset.root_path.trim().to_string();
+    preset.folder_template = preset.folder_template.trim().to_string();
+    preset.date_format = preset.date_format.trim().to_string();
+    preset.raw_folder = preset.raw_folder.trim().to_string();
+    preset.jpeg_folder = preset.jpeg_folder.trim().to_string();
+    preset.video_folder = preset.video_folder.trim().to_string();
+    if preset.name.is_empty() {
+        return Err("Preset name cannot be empty.".into());
+    }
+    if preset.folder_template.is_empty() || preset.date_format.is_empty() {
+        return Err("Preset folder template and date format cannot be empty.".into());
+    }
+    if preset.raw_folder.is_empty()
+        || preset.jpeg_folder.is_empty()
+        || preset.video_folder.is_empty()
+    {
+        return Err("Preset RAW, JPEG, and Video subfolder names cannot be empty.".into());
+    }
     state.db.upsert_import_preset(&preset).map_err(map_err)
 }
 
@@ -837,6 +963,9 @@ pub async fn run_import_pipeline(
     state: State<'_, AppState>,
     req: ImportPipelineRequest,
 ) -> Result<PipelineSummary, String> {
+    let Some(_import_guard) = state.try_lock_import() else {
+        return Err("An SD card import pipeline is already running.".into());
+    };
     let settings = state.db.load_settings().map_err(map_err)?;
     let db = state.db.clone();
     let paths = state.paths.clone();
@@ -1008,9 +1137,15 @@ pub async fn run_import_pipeline(
             }
         }
 
-        // Optional safe eject only if zero import failures
+        // Optional safe eject only if plan was non-empty, zero import failures, and dest_root is not on the same volume
         let mut ejected = false;
-        if req.eject_after && import_res.files_failed == 0 && !cancel.is_cancelled() {
+        let same_mount = Path::new(req.dest_root.trim()).starts_with(Path::new(req.source_root.trim()));
+        if req.eject_after
+            && !plan.is_empty()
+            && !same_mount
+            && import_res.files_failed == 0
+            && !cancel.is_cancelled()
+        {
             match eject_volume(Path::new(&req.source_root)) {
                 Ok(()) => {
                     ejected = true;
@@ -1028,10 +1163,7 @@ pub async fn run_import_pipeline(
                     let Some(lock) = st.try_lock_cloud(
                         pid,
                         Some(app.clone()),
-                        Some(FollowupSpec {
-                            do_sync: true,
-                            restore_mode: false,
-                        }),
+                        FollowupSpec::from_sync(true, false),
                     ) else {
                         notes.push(
                             "Google Drive sync for profile already running; queued automatic follow-up pass."
@@ -1102,10 +1234,7 @@ pub async fn run_import_pipeline(
                     let Some(lock) = st.try_lock_external(
                         pid,
                         Some(app.clone()),
-                        Some(FollowupSpec {
-                            do_sync: true,
-                            restore_mode: false,
-                        }),
+                        FollowupSpec::from_sync(true, false),
                     ) else {
                         notes.push(
                             "External drive sync already running; queued automatic follow-up pass."
@@ -1372,8 +1501,17 @@ pub fn save_cloud_profile(
     state: State<'_, AppState>,
     mut profile: CloudProfile,
 ) -> Result<String, String> {
-    if profile.name.trim().is_empty() || profile.local_root.trim().is_empty() {
+    if !profile.id.trim().is_empty() && state.is_cloud_locked(&profile.id) {
+        return Err(
+            "Cannot edit a Google Drive profile while it is actively syncing or verifying.".into(),
+        );
+    }
+    profile.local_root = profile.local_root.trim().to_string();
+    if profile.name.trim().is_empty() || profile.local_root.is_empty() {
         return Err("Profile name and local folder root are required.".into());
+    }
+    if !Path::new(&profile.local_root).is_absolute() {
+        return Err("Local folder root must be an absolute path.".into());
     }
     profile.remote_name = validate_rclone_remote_name(&profile.remote_name).map_err(map_err)?;
     validate_schedule(&profile.schedule_mode, &profile.schedule_value)?;
@@ -1383,6 +1521,12 @@ pub fn save_cloud_profile(
 
 #[tauri::command]
 pub fn delete_cloud_profile(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    if state.is_cloud_locked(&id) {
+        return Err(
+            "Cannot delete a Google Drive profile while it is actively syncing or verifying."
+                .into(),
+        );
+    }
     state.db.delete_cloud_profile(&id).map_err(map_err)
 }
 
@@ -1432,8 +1576,8 @@ pub async fn verify_cloud_cmd(
     profile_id: String,
     deep_md5: bool,
 ) -> Result<CloudVerifyReport, String> {
-    // Acquire lock WITHOUT queueing a write follow-up so read-only Verify never races Sync
-    let Some(_lock_guard) = state.try_lock_cloud(&profile_id, None, None) else {
+    // Acquire lock WITH app handle so any sync queued during Verify runs automatically on drop!
+    let Some(_lock_guard) = state.try_lock_cloud(&profile_id, Some(app.clone()), None) else {
         return Err("A Google Drive sync or verify is already running for this profile.".into());
     };
     let settings = state.db.load_settings().map_err(map_err)?;
@@ -1475,10 +1619,7 @@ pub async fn sync_cloud_cmd(
     let Some(lock_guard) = state.try_lock_cloud(
         &profile_id,
         Some(app.clone()),
-        Some(FollowupSpec {
-            do_sync: true,
-            restore_mode,
-        }),
+        FollowupSpec::from_sync(true, restore_mode),
     ) else {
         return Err(
             "A Google Drive sync is already running for this profile. A follow-up pass has been queued."
@@ -1543,14 +1684,14 @@ pub async fn sync_cloud_cmd(
             Ok(s) => {
                 let _ = db.finish_job(
                     &job_id,
-                    if s.conflicts_count > 0 {
+                    if s.failed_count > 0 || s.conflicts_count > 0 {
                         "partial"
                     } else {
                         "succeeded"
                     },
                     (s.uploaded_count + s.downloaded_count + s.backfill_replaced_count) as i64,
                     s.skipped_tombstones as i64,
-                    s.conflicts_count as i64,
+                    (s.failed_count + s.conflicts_count) as i64,
                     0,
                     serde_json::to_string(&s).ok().as_deref(),
                     None,
@@ -1560,6 +1701,18 @@ pub async fn sync_cloud_cmd(
                 Ok(s)
             }
             Err(e) => {
+                if !cancel.is_cancelled() {
+                    let _ = db.update_cloud_freshness(
+                        &profile.id,
+                        false,
+                        false,
+                        "failed",
+                        Some(&e.to_string()),
+                        profile.pending_upload_count,
+                        profile.pending_download_count,
+                        profile.pending_bytes,
+                    );
+                }
                 let st = if cancel.is_cancelled() {
                     "cancelled"
                 } else {
@@ -1593,11 +1746,21 @@ pub fn save_external_profile(
     state: State<'_, AppState>,
     mut profile: ExternalProfile,
 ) -> Result<String, String> {
+    if !profile.id.trim().is_empty() && state.is_external_locked(&profile.id) {
+        return Err(
+            "Cannot edit an external drive profile while it is actively syncing or verifying."
+                .into(),
+        );
+    }
+    profile.local_root = profile.local_root.trim().to_string();
     if profile.name.trim().is_empty()
-        || profile.local_root.trim().is_empty()
+        || profile.local_root.is_empty()
         || profile.volume_label.trim().is_empty()
     {
         return Err("Profile name, local folder root, and drive label are required.".into());
+    }
+    if !Path::new(&profile.local_root).is_absolute() {
+        return Err("Local folder root must be an absolute path.".into());
     }
     validate_schedule(&profile.schedule_mode, &profile.schedule_value)?;
     profile.stale_after_days = profile.stale_after_days.max(1);
@@ -1606,6 +1769,12 @@ pub fn save_external_profile(
 
 #[tauri::command]
 pub fn delete_external_profile(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    if state.is_external_locked(&id) {
+        return Err(
+            "Cannot delete an external drive profile while it is actively syncing or verifying."
+                .into(),
+        );
+    }
     state.db.delete_external_profile(&id).map_err(map_err)
 }
 
@@ -1616,7 +1785,7 @@ pub async fn verify_external_cmd(
     profile_id: String,
     deep_md5: bool,
 ) -> Result<ExternalVerifyReport, String> {
-    let Some(_lock_guard) = state.try_lock_external(&profile_id, None, None) else {
+    let Some(_lock_guard) = state.try_lock_external(&profile_id, Some(app.clone()), None) else {
         return Err("An external drive sync or verify is already running for this profile.".into());
     };
     let profile = state
@@ -1625,11 +1794,14 @@ pub async fn verify_external_cmd(
         .map_err(map_err)?
         .ok_or_else(|| "External drive profile not found".to_string())?;
     let db = state.db.clone();
-    let report =
-        tokio::task::spawn_blocking(move || verify_external_profile(&profile, &db, deep_md5))
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(map_err)?;
+    let cancel_reg = state.register_cancel(&format!("verify-ext:{profile_id}"));
+    let cancel = cancel_reg.token.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        verify_external_profile_cancellable(&profile, &db, deep_md5, &cancel)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(map_err)?;
     let _ = app.emit("profiles-updated", ());
     Ok(report)
 }
@@ -1644,10 +1816,7 @@ pub async fn sync_external_cmd(
     let Some(lock_guard) = state.try_lock_external(
         &profile_id,
         Some(app.clone()),
-        Some(FollowupSpec {
-            do_sync: true,
-            restore_mode,
-        }),
+        FollowupSpec::from_sync(true, restore_mode),
     ) else {
         return Err(
             "An external drive sync is already running for this profile. A follow-up pass has been queued."
@@ -1777,7 +1946,7 @@ pub fn show_main_window_cmd(app: AppHandle) {
 
 #[tauri::command]
 pub fn quit_app_cmd(app: AppHandle, state: State<'_, AppState>) {
-    state.cancel_all_active();
+    state.cancel_all_and_wait(std::time::Duration::from_secs(2));
     app.exit(0);
 }
 
@@ -1827,17 +1996,25 @@ pub async fn check_update_feed(app: AppHandle) -> Result<UpdateFeedStatus, Strin
     }
 }
 
-/// Downloads and installs a signed desktop update while cancelling active background jobs cleanly.
+/// Downloads and installs a signed desktop update while guarding against concurrent installs,
+/// cancelling active background jobs cleanly, and marking a clean post-update relaunch.
 #[tauri::command]
-pub async fn install_native_update(app: AppHandle) -> Result<(), String> {
+pub async fn install_native_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     use tauri_plugin_updater::UpdaterExt;
+
+    let Some(_update_guard) = state.try_lock_update() else {
+        return Err("An update installation is already in progress.".into());
+    };
 
     let exit_handle = app.clone();
     let updater = app
         .updater_builder()
         .on_before_exit(move || {
-            if let Some(state) = exit_handle.try_state::<AppState>() {
-                state.cancel_all_active();
+            if let Some(st) = exit_handle.try_state::<AppState>() {
+                st.cancel_all_and_wait(std::time::Duration::from_secs(3));
             }
             exit_handle.cleanup_before_exit();
         })
@@ -1852,6 +2029,9 @@ pub async fn install_native_update(app: AppHandle) -> Result<(), String> {
         return Err("No update available.".to_string());
     };
 
+    let marker_path = state.paths.data_dir.join("post_update_relaunch");
+    let _ = std::fs::write(&marker_path, "1");
+
     let downloaded = Arc::new(AtomicU64::new(0));
     let last_emitted = Arc::new(AtomicU64::new(0));
     let progress_app = app.clone();
@@ -1859,7 +2039,7 @@ pub async fn install_native_update(app: AppHandle) -> Result<(), String> {
     let dl_counter = Arc::clone(&downloaded);
     let emit_counter = Arc::clone(&last_emitted);
 
-    update
+    if let Err(e) = update
         .download_and_install(
             move |chunk_len, content_length| {
                 let total_dl =
@@ -1891,10 +2071,11 @@ pub async fn install_native_update(app: AppHandle) -> Result<(), String> {
             },
         )
         .await
-        .map_err(|e| format!("Failed to install update: {e}"))?;
-
-    if let Some(state) = app.try_state::<AppState>() {
-        state.cancel_all_active();
+    {
+        let _ = std::fs::remove_file(&marker_path);
+        return Err(format!("Failed to install update: {e}"));
     }
+
+    state.cancel_all_and_wait(std::time::Duration::from_secs(3));
     app.restart();
 }

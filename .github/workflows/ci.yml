@@ -81,6 +81,7 @@ jobs:
 
       - name: Rust format and lint
         # Both OSes: platform-specific code behind cfg(windows) / cfg(target_os = "macos") is linted here.
+        shell: bash
         working-directory: .
         # Pinned so a new stable release cannot add lints that fail unrelated changes.
         # Raise it on purpose after running clippy with the new version locally.
@@ -90,8 +91,13 @@ jobs:
           cargo +1.94.0 clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Rust tests
+        shell: bash
         working-directory: .
         run: cargo test --workspace --locked
+
+      - name: Stage bundled sidecars
+        shell: bash
+        run: node scripts/fetch-sidecars.mjs
 
       - name: Build installers
         shell: bash
@@ -102,7 +108,6 @@ jobs:
           TS_BUILD_VERSION: ${{ steps.version.outputs.version }}
           BUNDLES: ${{ matrix.bundles }}
         run: |
-          node scripts/fetch-sidecars.mjs
           # Signed updater archives need the private key (absent on fork PRs).
           if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then updater=true; else updater=false; fi
           npx tauri build --bundles "$BUNDLES" \
@@ -196,9 +201,12 @@ jobs:
             const signed = entries.filter(([, file]) =>
               fs.existsSync(`release-assets/${file}`) && fs.existsSync(`release-assets/${file}.sig`)
             );
-            if (signed.length === 0) {
-              console.log("No updater .sig files present (TAURI_SIGNING_PRIVATE_KEY unset); skipping latest.json.");
-              process.exit(0);
+            if (signed.length !== entries.length) {
+              const missing = entries
+                .filter(([, file]) => !fs.existsSync(`release-assets/${file}`) || !fs.existsSync(`release-assets/${file}.sig`))
+                .map(([p, f]) => `${p} (${f})`);
+              console.error("Refusing to publish release with missing updater artifacts/signatures:", missing.join(", "));
+              process.exit(1);
             }
             const platforms = Object.fromEntries(
               signed.map(([platform, file]) => {

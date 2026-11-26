@@ -173,6 +173,15 @@ pub fn verify_external_profile(
     deep_md5: bool,
 ) -> Result<ExternalVerifyReport> {
     let cancel = CancellationToken::new();
+    verify_external_profile_cancellable(profile, db, deep_md5, &cancel)
+}
+
+pub fn verify_external_profile_cancellable(
+    profile: &ExternalProfile,
+    db: &DbHandle,
+    deep_md5: bool,
+    cancel: &CancellationToken,
+) -> Result<ExternalVerifyReport> {
     let Some((vol, ext_root)) = resolve_external_target(profile) else {
         return Ok(ExternalVerifyReport {
             profile_id: profile.id.clone(),
@@ -191,6 +200,13 @@ pub fn verify_external_profile(
             pending_bytes: 0,
         });
     };
+    // Verify the resolved mount point is still present right before scanning
+    if !Path::new(&vol.mount_path).is_dir() {
+        return Err(anyhow!(
+            "External drive '{}' disconnected before verification could scan it.",
+            profile.volume_label
+        ));
+    }
     Ok(verify_external_roots_inner(
         profile,
         Path::new(&profile.local_root),
@@ -199,7 +215,7 @@ pub fn verify_external_profile(
         db,
         deep_md5,
         false,
-        &cancel,
+        cancel,
     )?
     .report)
 }
@@ -724,12 +740,42 @@ fn commit_part_file(part: &Path, dst: &Path, allow_overwrite: bool) -> Result<()
     }
 }
 
+fn check_mount_device_identity(mount_check: Option<(&Path, Option<u64>)>) -> Result<()> {
+    let Some((mount_root, expected_dev)) = mount_check else {
+        return Ok(());
+    };
+    let meta = std::fs::metadata(mount_root).map_err(|_| {
+        anyhow!(
+            "External drive disconnected during sync ({}).",
+            mount_root.display()
+        )
+    })?;
+    #[cfg(unix)]
+    if let Some(exp) = expected_dev {
+        use std::os::unix::fs::MetadataExt;
+        if meta.dev() != exp {
+            return Err(anyhow!(
+                "External drive device changed unexpectedly during sync ({}).",
+                mount_root.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (meta, expected_dev);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn atomic_copy_preserve_mtime(
+    dst_root: &Path,
     src: &Path,
     dst: &Path,
     allow_overwrite: bool,
+    expected_src_md5: Option<&str>,
+    expected_dst_pre_md5s: Option<&HashSet<String>>,
     cancel: &CancellationToken,
 ) -> Result<u64> {
+    crate::cloud::ensure_no_symlink_ancestors(dst_root, dst)?;
     if !allow_overwrite && dst.symlink_metadata().is_ok() {
         return Err(anyhow!(
             "Destination file already exists; strictly-additive sync refused overwrite: {}",
@@ -756,8 +802,10 @@ fn atomic_copy_preserve_mtime(
         .write(true)
         .create_new(true)
         .open(&part)?;
+    use md5::Digest;
     let mut buf = vec![0u8; 2 * 1024 * 1024];
     let mut copied = 0u64;
+    let mut hasher = expected_src_md5.map(|_| md5::Md5::new());
     loop {
         if cancel.is_cancelled() {
             drop(w);
@@ -770,6 +818,10 @@ fn atomic_copy_preserve_mtime(
             Err(e) => return Err(e.into()),
         };
         w.write_all(&buf[..n])?;
+        if let Some(ref mut h) = hasher {
+            use md5::Digest;
+            h.update(&buf[..n]);
+        }
         copied += n as u64;
     }
     // Flush data BEFORE set_modified so exFAT/FAT32/Windows flush never clobbers preserved mtime
@@ -781,6 +833,25 @@ fn atomic_copy_preserve_mtime(
     drop(w);
     if copied != expected {
         return Err(anyhow!("size mismatch copying {}", src.display()));
+    }
+    if let (Some(exp_md5), Some(h)) = (expected_src_md5, hasher) {
+        use md5::Digest;
+        let streamed = hex::encode(h.finalize());
+        if !streamed.eq_ignore_ascii_case(exp_md5) {
+            return Err(anyhow!(
+                "Aborted GPS backfill: source bytes changed mid-copy for {}",
+                src.display()
+            ));
+        }
+    }
+    if let Some(pre_set) = expected_dst_pre_md5s {
+        let live_dst_md5 = compute_file_md5(dst)?;
+        if !pre_set.contains(&live_dst_md5.to_ascii_lowercase()) {
+            return Err(anyhow!(
+                "Aborted GPS backfill: destination changed before atomic replace for {}",
+                dst.display()
+            ));
+        }
     }
     commit_part_file(&part, dst, allow_overwrite)?;
     guard.disarm();
@@ -806,10 +877,30 @@ where
             profile.volume_label
         ));
     };
-    sync_external_roots(
+    // Verify the resolved mount point is still present and record expected device ID (Unix)
+    let mount_path = PathBuf::from(&vol.mount_path);
+    let mount_meta = std::fs::metadata(&mount_path).map_err(|_| {
+        anyhow!(
+            "External drive '{}' disconnected before sync could start.",
+            profile.volume_label
+        )
+    })?;
+    #[cfg(unix)]
+    let expected_dev = {
+        use std::os::unix::fs::MetadataExt;
+        Some(mount_meta.dev())
+    };
+    #[cfg(not(unix))]
+    let expected_dev: Option<u64> = {
+        let _ = mount_meta;
+        None
+    };
+
+    sync_external_roots_with_mount_guard(
         profile,
         Path::new(&profile.local_root),
         &ext_root,
+        Some((&mount_path, expected_dev)),
         vol.writable,
         Some(vol.free_bytes),
         db,
@@ -837,7 +928,40 @@ pub fn sync_external_roots<F>(
 where
     F: Fn(&str, usize, usize, u64) + Send + Sync,
 {
+    sync_external_roots_with_mount_guard(
+        profile,
+        local_root,
+        ext_root,
+        None,
+        ext_writable,
+        ext_free_bytes,
+        db,
+        settings,
+        restore_mode,
+        cancel,
+        on_progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_external_roots_with_mount_guard<F>(
+    profile: &ExternalProfile,
+    local_root: &Path,
+    ext_root: &Path,
+    mount_guard: Option<(&Path, Option<u64>)>,
+    ext_writable: bool,
+    ext_free_bytes: Option<u64>,
+    db: &DbHandle,
+    settings: &AppSettings,
+    restore_mode: bool,
+    cancel: &CancellationToken,
+    on_progress: F,
+) -> Result<ExternalSyncResult>
+where
+    F: Fn(&str, usize, usize, u64) + Send + Sync,
+{
     let started = Instant::now();
+    check_mount_device_identity(mount_guard)?;
     if !local_root.is_dir() {
         if !restore_mode {
             return Err(anyhow!(
@@ -947,12 +1071,18 @@ where
             if cancel.is_cancelled() {
                 return;
             }
+            if let Err(e) = check_mount_device_identity(mount_guard) {
+                pull_failures.fetch_add(1, Ordering::Relaxed);
+                failures.lock().push((rel.clone(), e.to_string()));
+                cancel.cancel();
+                return;
+            }
             let src = ext_map
                 .get(rel)
                 .map(|e| e.abs_path.clone())
                 .unwrap_or_else(|| join_rel_path(ext_root, rel));
             let dst = join_rel_path(local_root, rel);
-            match atomic_copy_preserve_mtime(&src, &dst, false, cancel) {
+            match atomic_copy_preserve_mtime(local_root, &src, &dst, false, None, None, cancel) {
                 Ok(n) => {
                     pulled.fetch_add(1, Ordering::Relaxed);
                     succeeded_rels.lock().push((rel.clone(), dst));
@@ -973,12 +1103,18 @@ where
             if cancel.is_cancelled() {
                 return;
             }
+            if let Err(e) = check_mount_device_identity(mount_guard) {
+                push_failures.fetch_add(1, Ordering::Relaxed);
+                failures.lock().push((rel.clone(), e.to_string()));
+                cancel.cancel();
+                return;
+            }
             let src = local_map
                 .get(rel)
                 .map(|l| l.abs_path.clone())
                 .unwrap_or_else(|| join_rel_path(local_root, rel));
             let dst = join_rel_path(ext_root, rel);
-            match atomic_copy_preserve_mtime(&src, &dst, false, cancel) {
+            match atomic_copy_preserve_mtime(ext_root, &src, &dst, false, None, None, cancel) {
                 Ok(n) => {
                     pushed.fetch_add(1, Ordering::Relaxed);
                     succeeded_rels.lock().push((rel.clone(), src));
@@ -994,9 +1130,15 @@ where
             }
         });
 
-        // Pass 3: Safe GPS backfill updates (re-verifies BOTH local post_md5 & ext pre_md5 before overwriting!)
+        // Pass 3: Safe GPS backfill updates (stream-hashes copied bytes == post_md5 & re-verifies ext pre_md5!)
         backfills.par_iter().for_each(|rel| {
             if cancel.is_cancelled() {
+                return;
+            }
+            if let Err(e) = check_mount_device_identity(mount_guard) {
+                push_failures.fetch_add(1, Ordering::Relaxed);
+                failures.lock().push((rel.clone(), e.to_string()));
+                cancel.cancel();
                 return;
             }
             let src = local_map
@@ -1014,22 +1156,16 @@ where
                     .push((rel.clone(), "Missing intentional update metadata".into()));
                 return;
             };
-            // TOCTOU re-check immediately before destructive backfill replacement
-            let verified = match (compute_file_md5(&src), compute_file_md5(&dst)) {
-                (Ok(lm), Ok(em)) => {
-                    lm.eq_ignore_ascii_case(post_md5) && pre_set.contains(&em.to_ascii_lowercase())
-                }
-                _ => false,
-            };
-            if !verified {
-                push_failures.fetch_add(1, Ordering::Relaxed);
-                failures.lock().push((
-                    rel.clone(),
-                    "Aborted GPS backfill: file contents changed since verification".into(),
-                ));
-                return;
-            }
-            match atomic_copy_preserve_mtime(&src, &dst, true, cancel) {
+            // Stream-verify copied bytes == post_md5 AND re-verify dst == pre_set right before commit!
+            match atomic_copy_preserve_mtime(
+                ext_root,
+                &src,
+                &dst,
+                true,
+                Some(post_md5.as_str()),
+                Some(pre_set),
+                cancel,
+            ) {
                 Ok(n) => {
                     backfilled.fetch_add(1, Ordering::Relaxed);
                     succeeded_rels.lock().push((rel.clone(), src));

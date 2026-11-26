@@ -140,16 +140,22 @@ pub fn start_volume_watcher(app: AppHandle) {
                                 },
                             );
                         }
-                        if profile.schedule_mode == "on_connect" && !battery_blocked {
-                            let app_clone = app.clone();
-                            let pid = profile.id.clone();
-                            let do_sync = profile.schedule_action == "sync";
-                            tauri::async_runtime::spawn(async move {
-                                let _ = run_locked_external_sync_background(
-                                    &app_clone, &pid, do_sync, false,
-                                )
-                                .await;
-                            });
+                        if profile.schedule_mode == "on_connect" {
+                            if battery_blocked {
+                                if let Some(st) = app.try_state::<AppState>() {
+                                    st.deferred_on_connect.lock().insert(profile.id.clone());
+                                }
+                            } else {
+                                let app_clone = app.clone();
+                                let pid = profile.id.clone();
+                                let do_sync = profile.schedule_action == "sync";
+                                tauri::async_runtime::spawn(async move {
+                                    let _ = run_locked_external_sync_background(
+                                        &app_clone, &pid, do_sync, false,
+                                    )
+                                    .await;
+                                });
+                            }
                         }
                     }
                 }
@@ -189,7 +195,8 @@ pub fn start_background_scheduler(app: AppHandle) {
         let startup_done: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let last_daily_key: Arc<Mutex<HashMap<String, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let mut last_attempt: HashMap<String, Instant> = HashMap::new();
+        let last_failure: Arc<Mutex<HashMap<String, Instant>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let mut last_battery: Option<bool> = None;
 
         loop {
@@ -228,7 +235,13 @@ pub fn start_background_scheduler(app: AppHandle) {
 
                     for p in cloud_profiles.into_iter().filter(|p| p.enabled) {
                         let key = format!("cloud:{}", p.id);
-                        if recently_attempted(&last_attempt, &key, 15) {
+                        if app
+                            .try_state::<AppState>()
+                            .is_some_and(|st| st.is_cloud_locked(&p.id))
+                        {
+                            continue;
+                        }
+                        if recently_attempted(&last_failure.lock(), &key, 15) {
                             continue;
                         }
                         let latest_ref = latest_timestamp(
@@ -254,24 +267,27 @@ pub fn start_background_scheduler(app: AppHandle) {
                             _ => false,
                         };
                         if due {
-                            last_attempt.insert(key.clone(), Instant::now());
                             let app_c = app.clone();
                             let pid = p.id.clone();
                             let do_sync = p.schedule_action == "sync";
                             let mode = p.schedule_mode.clone();
                             let s_done = Arc::clone(&startup_done);
                             let d_done = Arc::clone(&last_daily_key);
+                            let fail_map = Arc::clone(&last_failure);
                             let today_c = today_str.clone();
                             tauri::async_runtime::spawn(async move {
                                 let ok =
                                     run_locked_cloud_sync_background(&app_c, &pid, do_sync, false)
                                         .await;
                                 if ok {
+                                    fail_map.lock().remove(&key);
                                     if mode == "startup" {
                                         s_done.lock().insert(key);
                                     } else if mode == "daily" {
                                         d_done.lock().insert(key, today_c);
                                     }
+                                } else {
+                                    fail_map.lock().insert(key, Instant::now());
                                 }
                             });
                         }
@@ -279,7 +295,25 @@ pub fn start_background_scheduler(app: AppHandle) {
 
                     for p in ext_profiles.into_iter().filter(|p| p.enabled) {
                         let key = format!("external:{}", p.id);
-                        if recently_attempted(&last_attempt, &key, 15) {
+                        if app
+                            .try_state::<AppState>()
+                            .is_some_and(|st| st.is_external_locked(&p.id))
+                        {
+                            continue;
+                        }
+                        if recently_attempted(&last_failure.lock(), &key, 15) {
+                            continue;
+                        }
+                        let connected = mounted_vols
+                            .iter()
+                            .any(|v| external_profile_matches_volume(&p, v));
+                        let was_deferred = app
+                            .try_state::<AppState>()
+                            .is_some_and(|st| st.deferred_on_connect.lock().contains(&p.id));
+                        if was_deferred && !connected {
+                            if let Some(st) = app.try_state::<AppState>() {
+                                st.deferred_on_connect.lock().remove(&p.id);
+                            }
                             continue;
                         }
                         let latest_ref = latest_timestamp(
@@ -289,6 +323,7 @@ pub fn start_background_scheduler(app: AppHandle) {
                         );
                         let daily_mem = last_daily_key.lock().get(&key).cloned();
                         let due = match p.schedule_mode.as_str() {
+                            "on_connect" => was_deferred,
                             "interval" => {
                                 let hours: i64 =
                                     p.schedule_value.trim().parse().unwrap_or(12).max(1);
@@ -303,24 +338,31 @@ pub fn start_background_scheduler(app: AppHandle) {
                             ),
                             _ => false,
                         };
-                        let connected = mounted_vols
-                            .iter()
-                            .any(|v| external_profile_matches_volume(&p, v));
                         if due && connected {
-                            last_attempt.insert(key.clone(), Instant::now());
+                            if was_deferred {
+                                if let Some(st) = app.try_state::<AppState>() {
+                                    st.deferred_on_connect.lock().remove(&p.id);
+                                }
+                            }
                             let app_c = app.clone();
                             let pid = p.id.clone();
                             let do_sync = p.schedule_action == "sync";
                             let mode = p.schedule_mode.clone();
                             let d_done = Arc::clone(&last_daily_key);
+                            let fail_map = Arc::clone(&last_failure);
                             let today_c = today_str.clone();
                             tauri::async_runtime::spawn(async move {
                                 let ok = run_locked_external_sync_background(
                                     &app_c, &pid, do_sync, false,
                                 )
                                 .await;
-                                if ok && mode == "daily" {
-                                    d_done.lock().insert(key, today_c);
+                                if ok {
+                                    fail_map.lock().remove(&key);
+                                    if mode == "daily" {
+                                        d_done.lock().insert(key, today_c);
+                                    }
+                                } else {
+                                    fail_map.lock().insert(key, Instant::now());
                                 }
                             });
                         }

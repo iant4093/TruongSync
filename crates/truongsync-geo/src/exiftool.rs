@@ -62,11 +62,14 @@ fn exiftool_safe_path_string(canon_path: &Path) -> String {
     let s = canon_path.to_string_lossy();
     #[cfg(windows)]
     {
-        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{rest}");
+        if s.len() >= 8 && s[..8].eq_ignore_ascii_case(r"\\?\UNC\") {
+            return format!(r"\\{}", &s[8..]);
         }
         if let Some(rest) = s.strip_prefix(r"\\?\") {
-            return rest.to_string();
+            let b = rest.as_bytes();
+            if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                return rest.to_string();
+            }
         }
     }
     s.into_owned()
@@ -102,10 +105,16 @@ pub fn resolve_exiftool_binary(override_path: Option<&str>) -> Option<PathBuf> {
     resolve_exiftool_with_origin(override_path).map(|(p, _)| p)
 }
 
+fn is_interactive_windows_exiftool(path: &Path) -> bool {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase().contains("(-k)"))
+        .unwrap_or(false)
+}
+
 fn resolve_exiftool_with_origin(override_path: Option<&str>) -> Option<(PathBuf, bool)> {
     if let Some(p) = override_path.filter(|s| !s.trim().is_empty()) {
         let pb = PathBuf::from(p.trim());
-        if pb.is_file() {
+        if pb.is_file() && !is_interactive_windows_exiftool(&pb) {
             return Some((pb, false));
         }
     }
@@ -144,7 +153,7 @@ fn resolve_exiftool_with_origin(override_path: Option<&str>) -> Option<(PathBuf,
     }
 
     let names: &[&str] = if cfg!(windows) {
-        &["exiftool.exe", "exiftool(-k).exe"]
+        &["exiftool.exe"]
     } else {
         &["exiftool"]
     };
@@ -170,12 +179,40 @@ pub fn check_exiftool(override_path: Option<&str>) -> ToolAvailability {
             version: None,
         };
     };
-    let version = new_exiftool_cmd(&bin)
-        .arg("-ver")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let version = (|| -> Option<String> {
+        let mut child = new_exiftool_cmd(&bin)
+            .arg("-ver")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return None;
+                    }
+                    let mut out = String::new();
+                    if let Some(mut stdout) = child.stdout.take() {
+                        let _ = std::io::Read::read_to_string(&mut stdout, &mut out);
+                    }
+                    let trimmed = out.trim().to_string();
+                    return (!trimmed.is_empty()).then_some(trimmed);
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(_) => return None,
+            }
+        }
+    })();
     ToolAvailability {
         available: version.is_some(),
         bundled,

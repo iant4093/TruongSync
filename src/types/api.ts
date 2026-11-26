@@ -320,6 +320,7 @@ export interface CloudSyncResult {
   downloaded_count: number;
   uploaded_count: number;
   backfill_replaced_count: number;
+  failed_count: number;
   conflicts_count: number;
   skipped_tombstones: number;
   duration_ms: number;

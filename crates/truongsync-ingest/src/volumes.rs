@@ -1,4 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -262,13 +264,15 @@ fn list_macos_volumes() -> Vec<DetectedVolume> {
 
         let mut is_disk_image = false;
         let mut is_internal_non_removable = false;
+        let mut diskutil_ok = false;
 
-        if let Ok(output) = std::process::Command::new("diskutil")
+        if let Ok(output) = std::process::Command::new("/usr/sbin/diskutil")
             .args(["info", "-plist"])
             .arg(&path)
             .output()
         {
             if output.status.success() {
+                diskutil_ok = true;
                 if let Ok(plist::Value::Dictionary(dict)) = plist::from_bytes(&output.stdout) {
                     if let Some(s) = dict
                         .get("VolumeUUID")
@@ -331,6 +335,11 @@ fn list_macos_volumes() -> Vec<DetectedVolume> {
         }
         // Skip mounted `.dmg` disk images and non-removable internal APFS partitions
         if is_disk_image || (is_internal_non_removable && !vol.has_dcim) {
+            continue;
+        }
+        // Only fall back to label-derived ID when diskutil succeeded but reported no UUID
+        // (prevents transient diskutil errors from mutating volume_uuid and triggering fake reconnects)
+        if !diskutil_ok {
             continue;
         }
         if vol.volume_uuid.is_empty() {
@@ -505,10 +514,14 @@ pub fn find_mounted_volume(volume_uuid: &str, volume_label: &str) -> Option<Dete
     None
 }
 
-/// Validates a Windows drive root (`X:` or `X:\`) before passing to OS eject helpers.
+/// Validates a Windows drive root (`X:`, `X:\`, `X:/`, or `\\?\X:\`) before passing to OS eject helpers.
 #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 pub(crate) fn validate_windows_drive_root(raw: &str) -> Option<String> {
-    let trimmed = raw.trim().trim_end_matches('\\');
+    let mut trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix(r"\\?\") {
+        trimmed = rest;
+    }
+    let trimmed = trimmed.trim_end_matches(['\\', '/']);
     let bytes = trimmed.as_bytes();
     if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         Some(trimmed.to_ascii_uppercase())
@@ -517,19 +530,83 @@ pub(crate) fn validate_windows_drive_root(raw: &str) -> Option<String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn validate_macos_ejectable_mount(mount_path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    // Reject any lexical traversal (`..`) before canonicalizing
+    for comp in mount_path.components() {
+        if matches!(comp, Component::ParentDir) {
+            return Err(anyhow!(
+                "Refusing to eject path with traversal segments: {}",
+                mount_path.display()
+            ));
+        }
+    }
+    let canon = std::fs::canonicalize(mount_path).with_context(|| {
+        format!(
+            "Refusing to eject non-existent mount path: {}",
+            mount_path.display()
+        )
+    })?;
+    let comps: Vec<Component<'_>> = canon.components().collect();
+    if comps.len() != 3
+        || !matches!(comps[0], Component::RootDir)
+        || comps[1].as_os_str() != "Volumes"
+        || !is_macos_real_volume_mount(&canon)
+    {
+        return Err(anyhow!(
+            "Refusing to eject path that is not a top-level mounted volume under /Volumes: {}",
+            canon.display()
+        ));
+    }
+    // Verify via diskutil info -plist that the volume is actually removable/ejectable/external
+    let info = std::process::Command::new("/usr/sbin/diskutil")
+        .args(["info", "-plist"])
+        .arg(&canon)
+        .output()
+        .context("failed to query diskutil info before eject")?;
+    if !info.status.success() {
+        return Err(anyhow!(
+            "Could not verify volume metadata before eject: {}",
+            String::from_utf8_lossy(&info.stderr).trim()
+        ));
+    }
+    let plist::Value::Dictionary(dict) =
+        plist::from_bytes(&info.stdout).context("failed to parse diskutil info plist")?
+    else {
+        return Err(anyhow!("Unexpected diskutil info plist format"));
+    };
+    let ejectable = dict
+        .get("Ejectable")
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false);
+    let removable = dict
+        .get("RemovableMediaOrExternalDevice")
+        .or_else(|| dict.get("RemovableMedia"))
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false);
+    let internal = dict
+        .get("Internal")
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(true);
+    if internal && !ejectable && !removable {
+        return Err(anyhow!(
+            "Refusing to eject internal non-removable volume: {}",
+            canon.display()
+        ));
+    }
+    Ok(canon)
+}
+
 /// Safely ejects a mounted removable volume.
 pub fn eject_volume(mount_path: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        if !mount_path.starts_with("/Volumes/") || !is_macos_real_volume_mount(mount_path) {
-            return Err(anyhow!(
-                "Refusing to eject path that is not a mounted volume under /Volumes: {}",
-                mount_path.display()
-            ));
-        }
-        let out = std::process::Command::new("diskutil")
-            .args(["eject", "--"])
-            .arg(mount_path)
+        let validated = validate_macos_ejectable_mount(mount_path)?;
+        // Note: macOS `diskutil eject` rejects `--`; validated path always begins with `/Volumes/`.
+        let out = std::process::Command::new("/usr/sbin/diskutil")
+            .arg("eject")
+            .arg(&validated)
             .output()
             .context("failed to run diskutil eject")?;
         if !out.status.success() {
@@ -546,8 +623,8 @@ pub fn eject_volume(mount_path: &Path) -> Result<()> {
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE};
         use windows::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            OPEN_EXISTING,
+            CreateFileW, GetDriveTypeW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, OPEN_EXISTING,
         };
         use windows::Win32::System::Ioctl::{
             FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, IOCTL_STORAGE_EJECT_MEDIA,
@@ -562,6 +639,22 @@ pub fn eject_volume(mount_path: &Path) -> Result<()> {
                     mount_path.display()
                 )
             })?;
+        if let Ok(sys_drive) = std::env::var("SystemDrive") {
+            if sys_drive.trim().eq_ignore_ascii_case(&drive) {
+                return Err(anyhow!("Refusing to eject Windows system drive {drive}."));
+            }
+        }
+        let root_w: Vec<u16> = std::ffi::OsStr::new(&format!(r"{drive}\"))
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // DRIVE_REMOVABLE = 2; refuse to forcibly dismount fixed/network/system partitions.
+        let drive_type = unsafe { GetDriveTypeW(PCWSTR(root_w.as_ptr())) };
+        if drive_type != 2 {
+            return Err(anyhow!(
+                "Refusing to eject non-removable Windows volume {drive} (drive type {drive_type})."
+            ));
+        }
         let dev_path = format!(r"\\.\{drive}");
         let wide: Vec<u16> = std::ffi::OsStr::new(&dev_path)
             .encode_wide()
@@ -621,7 +714,7 @@ pub fn eject_volume(mount_path: &Path) -> Result<()> {
                     None,
                 );
 
-                let _ = DeviceIoControl(
+                DeviceIoControl(
                     handle,
                     IOCTL_STORAGE_EJECT_MEDIA,
                     None,
@@ -630,7 +723,8 @@ pub fn eject_volume(mount_path: &Path) -> Result<()> {
                     0,
                     Some(&mut bytes_returned),
                     None,
-                );
+                )
+                .map_err(|e| anyhow!("Failed to eject removable media {drive}: {e}"))?;
             }
             Ok(())
         })();

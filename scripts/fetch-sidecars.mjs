@@ -36,8 +36,9 @@ function downloadFile(url, dest) {
 
 function extractArchive(archivePath, destDir) {
   if (platform === 'win32') {
-    // Built-in bsdtar on Windows 10/11 supports both .zip and .tar.gz with zero shell interpolation.
-    execFileSync('tar.exe', ['-xf', archivePath, '-C', destDir], { stdio: 'inherit' });
+    // Invoke Windows System32 bsdtar explicitly so Git Bash PATH never resolves GNU tar.exe.
+    const winTar = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+    execFileSync(winTar, ['-xf', archivePath, '-C', destDir], { stdio: 'inherit' });
   } else if (archivePath.endsWith('.zip')) {
     execFileSync('unzip', ['-qo', archivePath, '-d', destDir], { stdio: 'inherit' });
   } else {
@@ -88,10 +89,26 @@ function swapDirAtomic(stageDir, targetDir) {
   }
 }
 
+function minimalVerifyEnv() {
+  if (platform === 'win32') {
+    return {
+      SystemRoot: process.env.SystemRoot || 'C:\\Windows',
+      TEMP: process.env.TEMP || 'C:\\Windows\\Temp',
+      TMP: process.env.TMP || 'C:\\Windows\\Temp',
+      PATH: process.env.PATH || '',
+    };
+  }
+  return { PATH: '/usr/bin:/bin' };
+}
+
 function verifyRcloneBinary(binPath) {
   if (!fs.existsSync(binPath)) return false;
   try {
-    const out = execFileSync(binPath, ['version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const out = execFileSync(binPath, ['version'], {
+      encoding: 'utf8',
+      env: minimalVerifyEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     const expectedArch = arch === 'arm64' ? 'arm64' : 'amd64';
     return out.includes('rclone v') && out.toLowerCase().includes(expectedArch);
   } catch {
@@ -104,7 +121,7 @@ function verifyExiftoolBinary(binPath) {
   try {
     const ver = execFileSync(binPath, ['-ver'], {
       encoding: 'utf8',
-      env: platform === 'darwin' ? { PATH: '/usr/bin:/bin' } : process.env,
+      env: minimalVerifyEnv(),
       stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
     return /^\d+\.\d+$/.test(ver) ? ver : null;

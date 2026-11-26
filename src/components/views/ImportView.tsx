@@ -104,7 +104,9 @@ export const ImportView: React.FC = () => {
   const settings = useSyncStore((s) => s.settings);
   const cloudProfiles = useSyncStore((s) => s.cloudProfiles);
   const externalProfiles = useSyncStore((s) => s.externalProfiles);
-  const activeProgress = useSyncStore((s) => s.activeProgress);
+  const activeJobs = useSyncStore((s) => s.activeJobs);
+  const importProgress =
+    Object.values(activeJobs).find((j) => j.stage === 'import' || j.stage === 'geotag') ?? null;
   const pendingAutoImportPath = useSyncStore((s) => s.pendingAutoImportPath);
   const setPendingAutoImportPath = useSyncStore((s) => s.setPendingAutoImportPath);
   const refreshVolumes = useSyncStore((s) => s.refreshVolumes);
@@ -272,6 +274,7 @@ export const ImportView: React.FC = () => {
   }, [destRoot, folderTemplate, dateFormat, rawFolder, jpegFolder, videoFolder, splitByDate, shootName, category, folderDate, dateAssignments]);
 
   const handleScanSource = async (path: string, opts?: { preserveSummary?: boolean }) => {
+    if (running) return;
     const seq = ++scanSeqRef.current;
     setSourceRoot(path);
     setScan(null);
@@ -1037,21 +1040,21 @@ export const ImportView: React.FC = () => {
           </div>
 
           {/* Live Progress Bar */}
-          {running && activeProgress && (
+          {running && importProgress && (
             <div className="card" style={{ marginTop: 14 }}>
               <div className="card-body stack">
                 <div className="row-between">
-                  <strong>{activeProgress.message}</strong>
+                  <strong>{importProgress.message}</strong>
                   <span className="mono muted tabular">
-                    {activeProgress.speed_bps > 0 ? `${formatBytes(activeProgress.speed_bps)}/s` : activeProgress.stage}
+                    {importProgress.speed_bps > 0 ? `${formatBytes(importProgress.speed_bps)}/s` : importProgress.stage}
                   </span>
                 </div>
                 <div className="upload-progress-bar">
                   <div
                     style={{
                       width: `${
-                        activeProgress.files_total > 0
-                          ? Math.min(100, (activeProgress.files_done / activeProgress.files_total) * 100)
+                        importProgress.files_total > 0
+                          ? Math.min(100, (importProgress.files_done / importProgress.files_total) * 100)
                           : 15
                       }%`,
                     }}
@@ -1059,12 +1062,12 @@ export const ImportView: React.FC = () => {
                 </div>
                 <div className="row-between">
                   <span className="muted tabular">
-                    {activeProgress.files_done} / {activeProgress.files_total} files
+                    {importProgress.files_done} / {importProgress.files_total} files
                   </span>
                   <button
                     type="button"
                     className="button button-danger"
-                    onClick={() => void api.cancelActiveJob(activeProgress.job_id)}
+                    onClick={() => void api.cancelActiveJob(importProgress.job_id)}
                   >
                     Cancel
                   </button>

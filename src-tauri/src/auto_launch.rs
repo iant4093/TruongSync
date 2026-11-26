@@ -41,14 +41,30 @@ fn xml_escape(input: &str) -> String {
 /// or macOS `open --args`.
 pub fn normalize_import_volume_arg(raw: &str) -> String {
     let trimmed = raw.trim().trim_matches('"').trim();
+    if let Some(prefix) = trimmed.strip_suffix(r"\\.") {
+        if prefix.len() == 2 && prefix.as_bytes()[1] == b':' {
+            return format!(r"{prefix}\");
+        }
+        return prefix.to_string();
+    }
     if let Some(prefix) = trimmed.strip_suffix(r"\.") {
-        return format!(r"{prefix}\");
+        if prefix.len() == 2 && prefix.as_bytes()[1] == b':' {
+            return format!(r"{prefix}\");
+        }
+        return prefix.to_string();
     }
     if let Some(prefix) = trimmed.strip_suffix("/.") {
         if prefix.is_empty() {
             return "/".into();
         }
         return prefix.to_string();
+    }
+    // Handle bare Windows drive with trailing dot from legacy `%1.` (`E:.` -> `E:\`)
+    if let Some(prefix) = trimmed.strip_suffix('.') {
+        let b = prefix.as_bytes();
+        if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return format!(r"{prefix}\");
+        }
     }
     trimmed.to_string()
 }
@@ -112,16 +128,18 @@ pub fn set_os_native_auto_launch(enabled: bool) -> Result<String> {
     <integer>2</integer>
     <key>RunAtLoad</key>
     <false/>
+    <key>AbandonProcessGroup</key>
+    <true/>
 </dict>
 </plist>
 "#
             );
             std::fs::write(&plist_path, plist_xml)?;
             // Bootout any prior registration before bootstrapping cleanly
-            let _ = std::process::Command::new("launchctl")
+            let _ = std::process::Command::new("/bin/launchctl")
                 .args(["bootout", &service_target])
                 .output();
-            let boot_out = std::process::Command::new("launchctl")
+            let boot_out = std::process::Command::new("/bin/launchctl")
                 .args(["bootstrap", &gui_domain])
                 .arg(&plist_path)
                 .output()
@@ -135,7 +153,7 @@ pub fn set_os_native_auto_launch(enabled: bool) -> Result<String> {
                 plist_path.display()
             ))
         } else {
-            let _ = std::process::Command::new("launchctl")
+            let _ = std::process::Command::new("/bin/launchctl")
                 .args(["bootout", &service_target])
                 .output();
             if plist_path.exists() {
@@ -235,11 +253,11 @@ fn set_windows_autoplay_registry(enabled: bool) -> Result<String> {
             set_reg_sz(&ev_key, Some("TruongSyncImportHandler"), "")?;
         }
 
-        // `%1.` prevents Windows drive root `E:\` from turning into `E:\"` (escaped quote) under CommandLineToArgvW!
+        // `%1\\.` protects both `E:\` (becomes `E:\\.`) and `E:` / `E:\DCIM` from quote escaping under CommandLineToArgvW
         set_reg_sz(
             &format!(r"{prog_key}\shell\open\command"),
             None,
-            &format!("\"{exe_str}\" --import-volume \"%1.\""),
+            &format!("\"{exe_str}\" --import-volume \"%1\\\\.\""),
         )?;
 
         Ok("Registered Windows AutoPlay handler (HKCU). Select TruongSync once in Windows AutoPlay settings for memory cards.".into())
@@ -279,7 +297,8 @@ pub fn check_new_sd_card_for_launch_agent() -> Option<String> {
         truongsync_db::models::StoragePaths::default_data_dir(),
     );
     let _ = paths.ensure_dirs();
-    if let Ok(db) = truongsync_db::DbHandle::open(&paths.db_path) {
+    // Open SQLite strictly read-only so `--check-mounts` NEVER mutates or marks active GUI jobs interrupted!
+    if let Ok(db) = truongsync_db::DbHandle::open_readonly(&paths.db_path) {
         if let Ok(settings) = db.load_settings() {
             if !settings.auto_open_on_sd_insert {
                 return None;
@@ -327,11 +346,12 @@ pub fn launch_gui_for_volume(mount_path: &str) {
             .and_then(|p| p.parent())
             .filter(|p| p.extension().is_some_and(|e| e == "app"))
         {
+            // Wait for `/usr/bin/open` to finish handing off to LaunchServices before helper exits
             let _ = std::process::Command::new("/usr/bin/open")
                 .arg("-a")
                 .arg(app_bundle)
                 .args(["--args", "--import-volume", mount_path])
-                .spawn();
+                .status();
             return;
         }
     }

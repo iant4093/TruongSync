@@ -416,6 +416,11 @@ pub fn build_geotag_plan(
         }
     }
 
+    if clock_offset_secs.abs() > 31_536_000 {
+        return Err(anyhow::anyhow!(
+            "Camera clock offset must be within ±365 days (±31,536,000 seconds)."
+        ));
+    }
     let offset = Duration::try_seconds(clock_offset_secs)
         .ok_or_else(|| anyhow::anyhow!("clock_offset_secs out of valid range"))?;
     let mut items: Vec<PhotoGpsMatch> = files
@@ -465,7 +470,20 @@ pub fn build_geotag_plan(
                 };
             };
 
-            let adjusted = ts + offset;
+            let Some(adjusted) = ts.checked_add_signed(offset) else {
+                return PhotoGpsMatch {
+                    path: path_str,
+                    filename,
+                    media_kind,
+                    capture_time_utc: None,
+                    has_existing_gps: has_existing,
+                    status: MatchStatus::OutOfRange,
+                    lat: None,
+                    lon: None,
+                    ele: None,
+                    nearest_point_delta_secs: None,
+                };
+            };
             if has_existing && !overwrite_existing {
                 return PhotoGpsMatch {
                     path: path_str,

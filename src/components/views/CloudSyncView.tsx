@@ -113,7 +113,7 @@ export const CloudSyncView: React.FC = () => {
       await api.saveCloudProfile({
         ...editing,
         schedule_value: editing.schedule_value.trim(),
-        stale_after_days: Math.max(1, editing.stale_after_days || 7),
+        stale_after_days: Math.max(1, Math.trunc(Number(editing.stale_after_days) || 7)),
       });
       notifySuccess(`Saved cloud profile "${editing.name}".`);
       setEditing(null);
@@ -151,11 +151,16 @@ export const CloudSyncView: React.FC = () => {
     setProfileBusy(profile.id, 'sync');
     try {
       const res = await api.syncCloud(profile.id, restoreMode);
-      notifySuccess(
-        `${restoreMode ? 'Restored' : 'Synced'} "${profile.name}": ↑${res.uploaded_count} uploaded, ↓${res.downloaded_count} downloaded${
-          res.backfill_replaced_count > 0 ? `, ${res.backfill_replaced_count} GPS backfills updated` : ''
-        }.`,
-      );
+      const summary = `${restoreMode ? 'Restored' : 'Synced'} "${profile.name}": ↑${res.uploaded_count} uploaded, ↓${res.downloaded_count} downloaded${
+        res.backfill_replaced_count > 0 ? `, ${res.backfill_replaced_count} GPS backfills updated` : ''
+      }`;
+      if (res.failed_count > 0 || res.conflicts_count > 0) {
+        notifyError(
+          `${summary} (${res.failed_count} failed, ${res.conflicts_count} conflict(s) skipped safely).`,
+        );
+      } else {
+        notifySuccess(`${summary}.`);
+      }
       setVerifyReports((prev) => {
         const next = { ...prev };
         delete next[profile.id];
@@ -281,14 +286,25 @@ export const CloudSyncView: React.FC = () => {
               <span className="muted">
                 Opens your browser for Google sign-in and stores the token in TruongSync&apos;s private config.
               </span>
-              <button
-                type="button"
-                className="button button-primary"
-                disabled={oauthBusy}
-                onClick={() => void handleConnectOauth()}
-              >
-                {oauthBusy ? 'Waiting for browser…' : 'Sign in with Google'}
-              </button>
+              <div className="row">
+                {oauthBusy && (
+                  <button
+                    type="button"
+                    className="button button-danger"
+                    onClick={() => void api.cancelActiveJob()}
+                  >
+                    Cancel Sign-In
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="button button-primary"
+                  disabled={oauthBusy}
+                  onClick={() => void handleConnectOauth()}
+                >
+                  {oauthBusy ? 'Waiting for browser…' : 'Sign in with Google'}
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -322,7 +338,7 @@ export const CloudSyncView: React.FC = () => {
                     className="button"
                     onClick={async () => {
                       const d = await pickDirectory('Choose Local Folder to Sync');
-                      if (d) setEditing({ ...editing, local_root: d });
+                      if (d) setEditing((prev) => (prev ? { ...prev, local_root: d } : prev));
                     }}
                   >
                     Browse
@@ -393,9 +409,13 @@ export const CloudSyncView: React.FC = () => {
                   type="number"
                   className="text-input"
                   min={1}
+                  step={1}
                   value={editing.stale_after_days}
                   onChange={(e) =>
-                    setEditing({ ...editing, stale_after_days: Math.max(1, Number(e.target.value) || 7) })
+                    setEditing({
+                      ...editing,
+                      stale_after_days: Math.max(1, Math.trunc(Number(e.target.value) || 7)),
+                    })
                   }
                 />
               </div>

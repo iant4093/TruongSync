@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::{Datelike, NaiveDate};
 use std::path::{Path, PathBuf};
+use unicode_normalization::UnicodeNormalization;
 
 const MONTHS_SHORT: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -101,10 +102,11 @@ fn is_windows_reserved_name(segment: &str) -> bool {
 }
 
 /// Sanitizes a single folder segment so macOS and Windows both accept it cleanly
-/// (blocks path traversal `..`, illegal characters, trailing dots/spaces, and Windows device names).
+/// (blocks path traversal `..`, hidden leading dots, illegal characters, trailing dots/spaces,
+/// NFD/NFC mismatch, and Windows reserved device names).
 pub fn sanitize_segment(input: &str) -> String {
-    let trimmed = input.trim();
-    let mut s: String = trimmed
+    let nfc: String = input.trim().nfc().collect();
+    let mut s: String = nfc
         .chars()
         .map(|c| match c {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
@@ -115,6 +117,8 @@ pub fn sanitize_segment(input: &str) -> String {
     while s.ends_with('.') || s.ends_with(' ') {
         s.pop();
     }
+    let trimmed_dots = s.trim_start_matches('.').trim().to_string();
+    s = trimmed_dots;
     if s.is_empty() || s == "." || s == ".." {
         return "Untitled".into();
     }
@@ -125,6 +129,30 @@ pub fn sanitize_segment(input: &str) -> String {
         s = format!("Shoot_{}", s.trim_start_matches(['.', '_']));
     }
     s
+}
+
+/// Sanitizes a media filename (stem + extension) for cross-platform macOS/Windows/exFAT safety.
+pub fn sanitize_filename(raw: &str) -> Option<String> {
+    let leaf = Path::new(raw).file_name()?.to_string_lossy().to_string();
+    let nfc: String = leaf.trim().nfc().collect();
+    let mut cleaned: String = nfc
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    while cleaned.ends_with('.') || cleaned.ends_with(' ') {
+        cleaned.pop();
+    }
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return None;
+    }
+    if is_windows_reserved_name(&cleaned) {
+        cleaned.insert(0, '_');
+    }
+    Some(cleaned)
 }
 
 #[derive(Debug, Clone)]
@@ -250,7 +278,7 @@ pub fn list_or_init_year_categories(
     if let Ok(rd) = std::fs::read_dir(&year_dir) {
         for entry in rd.flatten() {
             if entry.path().is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
+                let name: String = entry.file_name().to_string_lossy().nfc().collect();
                 if !name.starts_with('.') {
                     categories.push(name);
                 }

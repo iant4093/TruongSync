@@ -5232,6 +5232,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "truongsync-db",
+ "unicode-normalization",
  "walkdir",
  "windows",
 ]

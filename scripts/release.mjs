@@ -9,7 +9,7 @@
 // Signing key: $TAURI_SIGNING_PRIVATE_KEY, or ~/.tauri/truongsync.key (created by `tauri signer generate`).
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -25,7 +25,22 @@ const override = cfgIdx >= 0 && args[cfgIdx + 1]?.trim().startsWith('{') ? JSON.
 const version = override.version ?? conf.version;
 const endpoint = override.plugins?.updater?.endpoints?.[0] ?? conf.plugins?.updater?.endpoints?.[0] ?? '';
 
-// 1. Signing key for updater artifacts
+const targetIdx = args.indexOf('--target');
+const targetTriple = targetIdx >= 0 ? args[targetIdx + 1] : null;
+
+// 1a. Fetch bundled rclone + ExifTool sidecars BEFORE loading the release signing private key
+const sidecarEnv = { ...process.env };
+delete sidecarEnv.TAURI_SIGNING_PRIVATE_KEY;
+delete sidecarEnv.TAURI_SIGNING_PRIVATE_KEY_PATH;
+delete sidecarEnv.TAURI_SIGNING_PRIVATE_KEY_PASSWORD;
+const fetchSidecars = spawnSync(process.execPath, [join(root, 'scripts', 'fetch-sidecars.mjs')], {
+  cwd: root,
+  env: sidecarEnv,
+  stdio: 'inherit',
+});
+if (fetchSidecars.status !== 0) process.exit(fetchSidecars.status ?? 1);
+
+// 1b. Signing key for updater artifacts
 const env = { ...process.env };
 env.TS_BUILD_VERSION ??= version;
 if (!env.TAURI_SIGNING_PRIVATE_KEY) {
@@ -35,16 +50,8 @@ if (!env.TAURI_SIGNING_PRIVATE_KEY) {
     process.exit(1);
   }
   env.TAURI_SIGNING_PRIVATE_KEY = readFileSync(keyFile, 'utf8');
-  env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ??= '';
 }
-
-// 1b. Fetch bundled rclone + ExifTool sidecars before Tauri packages installers
-const fetchSidecars = spawnSync(process.execPath, [join(root, 'scripts', 'fetch-sidecars.mjs')], {
-  cwd: root,
-  env,
-  stdio: 'inherit',
-});
-if (fetchSidecars.status !== 0) process.exit(fetchSidecars.status ?? 1);
+env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ??= '';
 
 // Run the local Tauri CLI through Node: `npx` is `npx.cmd` on Windows, which spawnSync cannot
 // start without a shell.
@@ -53,14 +60,23 @@ const build = spawnSync(process.execPath, [tauriCli, 'build', ...args], { cwd: r
 if (build.status !== 0) process.exit(build.status ?? 1);
 
 // 2. latest.json — upload it plus the .tar.gz/.exe next to it to the GitHub release v<version>.
-const bundleCandidates = [
-  join(root, 'target', 'release', 'bundle'),
-  join(root, 'src-tauri', 'target', 'release', 'bundle'),
-];
+const bundleCandidates = targetTriple
+  ? [
+      join(root, 'target', targetTriple, 'release', 'bundle'),
+      join(root, 'src-tauri', 'target', targetTriple, 'release', 'bundle'),
+    ]
+  : [
+      join(root, 'target', 'release', 'bundle'),
+      join(root, 'src-tauri', 'target', 'release', 'bundle'),
+    ];
 const bundleDir = bundleCandidates.find((dir) => existsSync(dir)) ?? bundleCandidates[0];
-const platformKey = `${process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows' : 'linux'}-${
-  process.arch === 'arm64' ? 'aarch64' : 'x86_64'
-}`;
+const platformKey = targetTriple
+  ? `${targetTriple.includes('apple-darwin') ? 'darwin' : targetTriple.includes('windows') ? 'windows' : 'linux'}-${
+      targetTriple.startsWith('aarch64') ? 'aarch64' : 'x86_64'
+    }`
+  : `${process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows' : 'linux'}-${
+      process.arch === 'arm64' ? 'aarch64' : 'x86_64'
+    }`;
 const downloadBase = endpoint.includes('/releases/latest/download/')
   ? endpoint.replace(/\/releases\/latest\/download\/.*$/, `/releases/download/v${version}/`)
   : '';
@@ -70,15 +86,26 @@ for (const sub of ['macos', 'nsis', 'msi', 'appimage']) {
   const dir = join(bundleDir, sub);
   if (!existsSync(dir)) continue;
   for (const f of readdirSync(dir)) {
-    if (f.endsWith('.sig')) archives.push({ file: f.slice(0, -4), dir, sig: readFileSync(join(dir, f), 'utf8').trim() });
+    if (f.endsWith('.sig')) {
+      const sigPath = join(dir, f);
+      archives.push({
+        file: f.slice(0, -4),
+        dir,
+        sig: readFileSync(sigPath, 'utf8').trim(),
+        mtimeMs: statSync(sigPath).mtimeMs,
+      });
+    }
   }
 }
 if (!archives.length) {
   console.warn('[release] No signed updater archives found (is createUpdaterArtifacts enabled?)');
   process.exit(0);
 }
-// The Windows updater installs the NSIS setup, never the MSI.
-const pick = archives.find((a) => a.dir.endsWith('nsis')) ?? archives[0];
+// Prefer newest archive matching the built version (NSIS on Windows, never MSI).
+archives.sort((a, b) => b.mtimeMs - a.mtimeMs);
+const nsisArchives = archives.filter((a) => a.dir.endsWith('nsis'));
+const pool = nsisArchives.length ? nsisArchives : archives;
+const pick = pool.find((a) => a.file.includes(version)) ?? pool[0];
 const manifest = {
   version,
   notes: notes || `TruongSync ${version}`,

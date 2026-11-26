@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 pub fn is_on_battery() -> bool {
     #[cfg(target_os = "macos")]
     {
-        Command::new("pmset")
+        Command::new("/usr/bin/pmset")
             .args(["-g", "batt"])
             .output()
             .ok()
@@ -49,7 +49,7 @@ impl SleepGuard {
         #[cfg(target_os = "macos")]
         {
             let pid = std::process::id().to_string();
-            let child = Command::new("caffeinate")
+            let child = Command::new("/usr/bin/caffeinate")
                 .args(["-i", "-w", &pid])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
