@@ -1,0 +1,49 @@
+const APP_COMMANDS: &[&str] = &[
+    "get_bootstrap_info",
+    "check_tools",
+    "get_settings",
+    "save_settings",
+    "set_os_native_auto_launch",
+    "list_volumes",
+    "eject_volume_cmd",
+    "list_year_categories",
+    "create_category_folder",
+    "list_import_presets",
+    "save_import_preset",
+    "delete_import_preset",
+    "scan_card",
+    "preflight_import",
+    "preview_import_plan",
+    "run_import_pipeline",
+    "cancel_active_job",
+    "find_matching_gpx",
+    "preview_geotag",
+    "run_geotag",
+    "list_cloud_profiles",
+    "save_cloud_profile",
+    "delete_cloud_profile",
+    "import_rclone_conf",
+    "list_rclone_remotes_cmd",
+    "connect_google_drive",
+    "verify_cloud_cmd",
+    "sync_cloud_cmd",
+    "list_external_profiles",
+    "save_external_profile",
+    "delete_external_profile",
+    "verify_external_cmd",
+    "sync_external_cmd",
+    "list_jobs",
+    "list_job_items",
+    "show_main_window_cmd",
+    "quit_app_cmd",
+    "check_update_feed",
+    "install_native_update",
+];
+
+fn main() {
+    tauri_build::try_build(
+        tauri_build::Attributes::new()
+            .app_manifest(tauri_build::AppManifest::new().commands(APP_COMMANDS)),
+    )
+    .expect("failed to run tauri-build");
+}

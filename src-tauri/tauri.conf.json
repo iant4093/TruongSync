@@ -1,0 +1,57 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TruongSync",
+  "version": "0.1.0",
+  "identifier": "com.iantruong.truongsync",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1422",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "macOSPrivateApi": true,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' https://tiles.openfreemap.org data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' https://tiles.openfreemap.org data:; connect-src 'self' ipc: http://ipc.localhost https://tiles.openfreemap.org; worker-src 'self' blob:; child-src 'self' blob:;",
+      "devCsp": "default-src 'self' http://localhost:1422 ws://localhost:1422 ipc: http://ipc.localhost; img-src 'self' https://tiles.openfreemap.org data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' https://tiles.openfreemap.org data:; connect-src 'self' http://localhost:1422 ws://localhost:1422 ipc: http://ipc.localhost https://tiles.openfreemap.org; worker-src 'self' blob:; child-src 'self' blob:;"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Photography",
+    "shortDescription": "Fast SD card ingest, GPX geotagging, and 2-way additive photo backup",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "resources/rclone": "rclone",
+      "resources/exiftool": "exiftool"
+    },
+    "macOS": {
+      "signingIdentity": "-",
+      "entitlements": "Entitlements.plist"
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": "https?://[A-Za-z0-9\\-._~\\[\\]:/?#@!$&'()*+,;=%]+"
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDE1M0FBQTJDMUZBRTUwQkIKUldTN1VLNGZMS282RmVjMDVxb3IvcWJiMjZEcXBmMXNBNDVkb2hpaXFZZFB2NXJtZUxGaUFVT1gK",
+      "endpoints": [
+        "https://github.com/iant4093/TruongSync/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

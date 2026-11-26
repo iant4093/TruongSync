@@ -1,0 +1,228 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a release after desktop acceptance testing
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Type-check & frontend build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+            bundles: app,dmg
+          - name: Windows
+            os: windows-latest
+            bundles: nsis
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          base=$(node -p "require('./src-tauri/tauri.conf.json').version.split('.').slice(0,2).join('.')")
+          echo "version=${base}.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Rust format and lint
+        # Both OSes: platform-specific code behind cfg(windows) / cfg(target_os = "macos") is linted here.
+        working-directory: .
+        # Pinned so a new stable release cannot add lints that fail unrelated changes.
+        # Raise it on purpose after running clippy with the new version locally.
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal -c clippy,rustfmt
+          cargo +1.94.0 fmt --all -- --check
+          cargo +1.94.0 clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Rust tests
+        working-directory: .
+        run: cargo test --workspace --locked
+
+      - name: Build installers
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          VERSION: ${{ steps.version.outputs.version }}
+          TS_BUILD_VERSION: ${{ steps.version.outputs.version }}
+          BUNDLES: ${{ matrix.bundles }}
+        run: |
+          node scripts/fetch-sidecars.mjs
+          # Signed updater archives need the private key (absent on fork PRs).
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then updater=true; else updater=false; fi
+          npx tauri build --bundles "$BUNDLES" \
+            --config "{\"version\":\"$VERSION\",\"bundle\":{\"createUpdaterArtifacts\":$updater}}"
+
+      - name: Collect installers
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          if [ -d "target/release/bundle" ]; then
+            b=target/release/bundle
+          else
+            b=src-tauri/target/release/bundle
+          fi
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cp "$b"/dmg/*.dmg release-assets/TruongSync-macOS.dmg
+            if [ -f "$b/macos/TruongSync.app.tar.gz.sig" ]; then
+              cp "$b/macos/TruongSync.app.tar.gz" release-assets/TruongSync-macOS.app.tar.gz
+              cp "$b/macos/TruongSync.app.tar.gz.sig" release-assets/TruongSync-macOS.app.tar.gz.sig
+            fi
+          else
+            installers=("$b"/nsis/*-setup.exe)
+            setup="${installers[0]}"
+            cp "$setup" release-assets/TruongSync-Windows-Setup.exe
+            if [ -f "$setup.sig" ]; then cp "$setup.sig" release-assets/TruongSync-Windows-Setup.exe.sig; fi
+          fi
+          ls -la release-assets
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installers-${{ matrix.name }}
+          path: release-assets/
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    # First builds are test installers. Publishing is an explicit action after live testing.
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # full history + tags, for release notes since the previous release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: installers-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Release notes from commit messages
+        shell: bash
+        run: |
+          prev=$(git describe --tags --abbrev=0 --match 'v*' HEAD 2>/dev/null || true)
+          range="${prev:+$prev..}HEAD"
+          git log "$range" --no-merges --pretty='- %s' -n 60 \
+            | grep -viE '^- (merge|wip|bump version)\b' > release-notes.txt || true
+          [ -s release-notes.txt ] || echo "- Maintenance release" > release-notes.txt
+          {
+            echo "## What's new"
+            echo
+            cat release-notes.txt
+            echo
+            if [ -n "$prev" ]; then
+              echo "**Full changelog:** https://github.com/${GITHUB_REPOSITORY}/compare/${prev}...${GITHUB_SHA::7}"
+            else
+              echo "Built from ${GITHUB_SHA::7}."
+            fi
+          } > release-body.md
+          cat release-body.md
+
+      - name: Compose updater manifest and checksums
+        shell: bash
+        run: |
+          base=$(node -p "require('./src-tauri/tauri.conf.json').version.split('.').slice(0,2).join('.')")
+          version="${base}.${GITHUB_RUN_NUMBER}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          VERSION="$version" node <<'NODE'
+            const fs = require("fs");
+            const v = process.env.VERSION;
+            const url = (f) => `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/v${v}/${f}`;
+            const entries = [
+              ["darwin-aarch64", "TruongSync-macOS.app.tar.gz"],
+              ["windows-x86_64", "TruongSync-Windows-Setup.exe"],
+            ];
+            const signed = entries.filter(([, file]) =>
+              fs.existsSync(`release-assets/${file}`) && fs.existsSync(`release-assets/${file}.sig`)
+            );
+            if (signed.length === 0) {
+              console.log("No updater .sig files present (TAURI_SIGNING_PRIVATE_KEY unset); skipping latest.json.");
+              process.exit(0);
+            }
+            const platforms = Object.fromEntries(
+              signed.map(([platform, file]) => {
+                const signature = fs.readFileSync(`release-assets/${file}.sig`, "utf8").trim();
+                if (!signature) throw new Error(`Empty updater signature for ${platform}`);
+                return [platform, { signature, url: url(file) }];
+              })
+            );
+            const notes = fs.readFileSync("release-notes.txt", "utf8").trim() || `TruongSync ${v}`;
+            const manifest = { version: v, notes, pub_date: new Date().toISOString(), platforms };
+            fs.writeFileSync("release-assets/latest.json", JSON.stringify(manifest, null, 2));
+            console.log("Generated latest.json for:", Object.keys(platforms));
+          NODE
+          rm -f release-assets/*.sig
+          (cd release-assets && sha256sum -- * > SHA256SUMS)
+          ls -la release-assets
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${VERSION}" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "TruongSync ${VERSION}" \
+            --notes-file release-body.md \
+            --latest

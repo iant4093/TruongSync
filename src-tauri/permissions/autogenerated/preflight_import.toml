@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-preflight-import"
+description = "Enables the preflight_import command without any pre-configured scope."
+commands.allow = ["preflight_import"]
+
+[[permission]]
+identifier = "deny-preflight-import"
+description = "Denies the preflight_import command without any pre-configured scope."
+commands.deny = ["preflight_import"]

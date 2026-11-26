@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-cloud-profiles"
+description = "Enables the list_cloud_profiles command without any pre-configured scope."
+commands.allow = ["list_cloud_profiles"]
+
+[[permission]]
+identifier = "deny-list-cloud-profiles"
+description = "Denies the list_cloud_profiles command without any pre-configured scope."
+commands.deny = ["list_cloud_profiles"]

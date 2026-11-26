@@ -1,0 +1,29 @@
+[package]
+name = "truongsync-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+libc.workspace = true
+nom-exif.workspace = true
+parking_lot.workspace = true
+plist.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+truongsync-db.workspace = true
+walkdir.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

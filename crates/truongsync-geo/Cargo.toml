@@ -1,0 +1,27 @@
+[package]
+name = "truongsync-geo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+hex.workspace = true
+md-5.workspace = true
+nom-exif.workspace = true
+parking_lot.workspace = true
+quick-xml.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+truongsync-db.workspace = true
+truongsync-ingest.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

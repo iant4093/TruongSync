@@ -1,0 +1,90 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/truongsync-db",
+    "crates/truongsync-ingest",
+    "crates/truongsync-geo",
+    "crates/truongsync-sync",
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.90"
+authors = ["Ian Truong"]
+
+[workspace.dependencies]
+# Internal crates
+truongsync-db = { path = "crates/truongsync-db" }
+truongsync-ingest = { path = "crates/truongsync-ingest" }
+truongsync-geo = { path = "crates/truongsync-geo" }
+truongsync-sync = { path = "crates/truongsync-sync" }
+
+# Async & concurrency
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["rt", "io"] }
+parking_lot = "0.12.5"
+rayon = "1.12.0"
+
+# Database & hashing
+rusqlite = { version = "0.43.0", features = ["bundled", "backup", "functions"] }
+md-5 = "0.10.6"
+hex = "0.4.3"
+blake3 = "1.8.7"
+
+# Media, EXIF, GPX XML & filesystem
+nom-exif = "3.8.0"
+quick-xml = "0.42.0"
+walkdir = "2.5.0"
+tempfile = "3.27.0"
+plist = "1.10.4"
+libc = "0.2.183"
+unicode-normalization = "0.1.24"
+
+# Serialization, time, errors & logging
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+uuid = { version = "1.29.3", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+dirs = "6.0.0"
+
+# Tauri v2 (matching TruongPhoto)
+tauri = { version = "2.12.7", features = ["macos-private-api", "tray-icon", "image-png"] }
+tauri-build = "2.7.6"
+tauri-plugin-shell = "2.6.0"
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-autostart = "2.7.0"
+tauri-plugin-updater = "2.14.1"
+tauri-plugin-process = "2.4.0"
+tauri-plugin-single-instance = "2.5.5"
+
+# Platform native hooks
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Storage_FileSystem",
+] }
+objc2 = "0.6.5"
+block2 = "0.6.2"
+objc2-foundation = "0.3.2"
+objc2-app-kit = "0.3.2"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = true

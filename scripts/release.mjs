@@ -1,0 +1,93 @@
+#!/usr/bin/env node
+// scripts/release.mjs
+// One-command release build:
+//   1. stages self-contained rclone + ExifTool sidecars
+//   2. builds with Tauri, signing the updater archive with your private key
+//   3. writes latest.json (the manifest the in-app updater reads)
+//
+// Usage: npm run app:build [-- --notes "What changed"] [-- <extra tauri build args>]
+// Signing key: $TAURI_SIGNING_PRIVATE_KEY, or ~/.tauri/truongsync.key (created by `tauri signer generate`).
+
+import { spawnSync } from 'node:child_process';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const args = process.argv.slice(2);
+const notesIdx = args.indexOf('--notes');
+const notes = notesIdx >= 0 ? args.splice(notesIdx, 2)[1] : '';
+
+const conf = JSON.parse(readFileSync(join(root, 'src-tauri', 'tauri.conf.json'), 'utf8'));
+const cfgIdx = args.indexOf('--config');
+const override = cfgIdx >= 0 && args[cfgIdx + 1]?.trim().startsWith('{') ? JSON.parse(args[cfgIdx + 1]) : {};
+const version = override.version ?? conf.version;
+const endpoint = override.plugins?.updater?.endpoints?.[0] ?? conf.plugins?.updater?.endpoints?.[0] ?? '';
+
+// 1. Signing key for updater artifacts
+const env = { ...process.env };
+env.TS_BUILD_VERSION ??= version;
+if (!env.TAURI_SIGNING_PRIVATE_KEY) {
+  const keyFile = join(homedir(), '.tauri', 'truongsync.key');
+  if (!existsSync(keyFile)) {
+    console.error('[release] No signing key. Run: npx tauri signer generate -w ~/.tauri/truongsync.key');
+    process.exit(1);
+  }
+  env.TAURI_SIGNING_PRIVATE_KEY = readFileSync(keyFile, 'utf8');
+  env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ??= '';
+}
+
+// 1b. Fetch bundled rclone + ExifTool sidecars before Tauri packages installers
+const fetchSidecars = spawnSync(process.execPath, [join(root, 'scripts', 'fetch-sidecars.mjs')], {
+  cwd: root,
+  env,
+  stdio: 'inherit',
+});
+if (fetchSidecars.status !== 0) process.exit(fetchSidecars.status ?? 1);
+
+// Run the local Tauri CLI through Node: `npx` is `npx.cmd` on Windows, which spawnSync cannot
+// start without a shell.
+const tauriCli = join(root, 'node_modules', '@tauri-apps', 'cli', 'tauri.js');
+const build = spawnSync(process.execPath, [tauriCli, 'build', ...args], { cwd: root, env, stdio: 'inherit' });
+if (build.status !== 0) process.exit(build.status ?? 1);
+
+// 2. latest.json — upload it plus the .tar.gz/.exe next to it to the GitHub release v<version>.
+const bundleCandidates = [
+  join(root, 'target', 'release', 'bundle'),
+  join(root, 'src-tauri', 'target', 'release', 'bundle'),
+];
+const bundleDir = bundleCandidates.find((dir) => existsSync(dir)) ?? bundleCandidates[0];
+const platformKey = `${process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows' : 'linux'}-${
+  process.arch === 'arm64' ? 'aarch64' : 'x86_64'
+}`;
+const downloadBase = endpoint.includes('/releases/latest/download/')
+  ? endpoint.replace(/\/releases\/latest\/download\/.*$/, `/releases/download/v${version}/`)
+  : '';
+
+const archives = [];
+for (const sub of ['macos', 'nsis', 'msi', 'appimage']) {
+  const dir = join(bundleDir, sub);
+  if (!existsSync(dir)) continue;
+  for (const f of readdirSync(dir)) {
+    if (f.endsWith('.sig')) archives.push({ file: f.slice(0, -4), dir, sig: readFileSync(join(dir, f), 'utf8').trim() });
+  }
+}
+if (!archives.length) {
+  console.warn('[release] No signed updater archives found (is createUpdaterArtifacts enabled?)');
+  process.exit(0);
+}
+// The Windows updater installs the NSIS setup, never the MSI.
+const pick = archives.find((a) => a.dir.endsWith('nsis')) ?? archives[0];
+const manifest = {
+  version,
+  notes: notes || `TruongSync ${version}`,
+  pub_date: new Date().toISOString(),
+  platforms: {
+    [platformKey]: { signature: pick.sig, url: `${downloadBase}${encodeURIComponent(pick.file)}` },
+  },
+};
+const out = join(bundleDir, 'latest.json');
+writeFileSync(out, JSON.stringify(manifest, null, 2) + '\n');
+console.log(`\n[release] ${pick.file} (+ .sig) and latest.json are in ${bundleDir}`);
+console.log(`[release] Upload both to the GitHub release "v${version}".`);

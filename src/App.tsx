@@ -1,0 +1,93 @@
+import React, { useEffect } from 'react';
+import { BatteryCharging } from 'lucide-react';
+import { isTauri } from './lib/tauri';
+import { useSyncStore } from './store/useSyncStore';
+import type { NavTab } from './types/api';
+import { FeedbackHost } from './components/Feedback';
+import { Sidebar } from './components/Sidebar';
+import { Badge } from './components/ui';
+import { WindowsCaptionButtons, ensureWindowStateWatcher, isWindowsPlatform } from './components/WindowControls';
+import { ActivityView, JobInspectorDrawer } from './components/views/ActivityView';
+import { CloudSyncView } from './components/views/CloudSyncView';
+import { DriveBackupView } from './components/views/DriveBackupView';
+import { GeotagView } from './components/views/GeotagView';
+import { ImportView } from './components/views/ImportView';
+import { SettingsView } from './components/views/SettingsView';
+
+const nativeMacTitlebar = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform);
+const windowsCaption = !nativeMacTitlebar && isWindowsPlatform();
+
+const NAV_TITLES: Record<NavTab, string> = {
+  import: 'SD Card Import',
+  geotag: 'EXIF GPS Geotagging',
+  cloud: 'Google Drive Cloud Sync',
+  backup: 'External Drive Backup',
+  activity: 'Activity & History',
+  settings: 'Settings',
+};
+
+export const App: React.FC = () => {
+  const activeNav = useSyncStore((s) => s.activeNav);
+  const bootstrap = useSyncStore((s) => s.bootstrap);
+  const activeProgress = useSyncStore((s) => s.activeProgress);
+  const inspectorJobId = useSyncStore((s) => s.inspectorJobId);
+  const jobs = useSyncStore((s) => s.jobs);
+  const init = useSyncStore((s) => s.init);
+  const inspectorOpen = Boolean(
+    activeNav === 'activity' && inspectorJobId && jobs.some((j) => j.id === inspectorJobId),
+  );
+
+  useEffect(() => {
+    void init();
+    if (isTauri()) {
+      ensureWindowStateWatcher();
+      if (!nativeMacTitlebar) {
+        document.documentElement.classList.add('tauri-frameless');
+        document.body.classList.add('tauri-transparent');
+      }
+    }
+  }, [init]);
+
+  const frameClass = [
+    'app-window-frame studio-shell',
+    nativeMacTitlebar ? 'native-titlebar' : '',
+    windowsCaption ? 'windows-caption' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  return (
+    <div className={frameClass}>
+      <Sidebar />
+      <main className="workspace">
+        <header className="workspace-header" data-tauri-drag-region>
+          <span className="workspace-title" data-tauri-drag-region>
+            {NAV_TITLES[activeNav]}
+          </span>
+          <div className="workspace-controls">
+            {activeProgress && <Badge tone="info">{activeProgress.message}</Badge>}
+            {bootstrap?.on_battery && (
+              <Badge tone="warn">
+                <BatteryCharging size={12} /> Battery
+              </Badge>
+            )}
+          </div>
+          {isTauri() && windowsCaption && <WindowsCaptionButtons />}
+        </header>
+
+        <div className={`workspace-body ${inspectorOpen ? 'with-inspector' : ''}`}>
+          <div className="content-viewport">
+            {activeNav === 'import' && <ImportView />}
+            {activeNav === 'geotag' && <GeotagView />}
+            {activeNav === 'cloud' && <CloudSyncView />}
+            {activeNav === 'backup' && <DriveBackupView />}
+            {activeNav === 'activity' && <ActivityView />}
+            {activeNav === 'settings' && <SettingsView />}
+          </div>
+          <JobInspectorDrawer />
+        </div>
+      </main>
+      <FeedbackHost />
+    </div>
+  );
+};

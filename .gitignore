@@ -1,0 +1,29 @@
+# Dependencies & build artifacts
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/
+release-assets/
+
+# Bundled sidecars downloaded on build via scripts/fetch-sidecars.mjs
+src-tauri/resources/rclone/*
+!src-tauri/resources/rclone/.gitkeep
+src-tauri/resources/exiftool/*
+!src-tauri/resources/exiftool/.gitkeep
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.log
+
+# User legacy scripts, credentials, tokens & local databases (NEVER commit)
+legacy-scripts/
+client_secret_*.json
+rclone.conf
+*.db*
+*.key
+*.pem
+.env
+.env.*

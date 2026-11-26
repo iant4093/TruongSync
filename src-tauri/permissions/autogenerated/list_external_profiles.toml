@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-external-profiles"
+description = "Enables the list_external_profiles command without any pre-configured scope."
+commands.allow = ["list_external_profiles"]
+
+[[permission]]
+identifier = "deny-list-external-profiles"
+description = "Denies the list_external_profiles command without any pre-configured scope."
+commands.deny = ["list_external_profiles"]

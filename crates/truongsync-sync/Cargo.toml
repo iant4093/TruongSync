@@ -1,0 +1,30 @@
+[package]
+name = "truongsync-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+hex.workspace = true
+md-5.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+truongsync-db.workspace = true
+truongsync-geo.workspace = true
+truongsync-ingest.workspace = true
+walkdir.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

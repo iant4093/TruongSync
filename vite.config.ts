@@ -1,0 +1,17 @@
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  clearScreen: false,
+  server: {
+    port: 1422,
+    strictPort: true,
+    watch: {
+      ignored: ['**/src-tauri/**', '**/crates/**', '**/target/**', '**/legacy-scripts/**'],
+    },
+  },
+  build: {
+    target: ['es2022', 'chrome110', 'safari16'],
+  },
+});

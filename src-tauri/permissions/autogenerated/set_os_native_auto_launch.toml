@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-os-native-auto-launch"
+description = "Enables the set_os_native_auto_launch command without any pre-configured scope."
+commands.allow = ["set_os_native_auto_launch"]
+
+[[permission]]
+identifier = "deny-set-os-native-auto-launch"
+description = "Denies the set_os_native_auto_launch command without any pre-configured scope."
+commands.deny = ["set_os_native_auto_launch"]
