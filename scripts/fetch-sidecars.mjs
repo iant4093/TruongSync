@@ -31,7 +31,23 @@ function ensureDir(dir) {
 
 function downloadFile(url, dest) {
   console.log(`Downloading ${url}...`);
-  execFileSync('curl', ['-fsSL', '-L', '-o', dest, url], { stdio: 'inherit' });
+  execFileSync('curl', ['-fsSL', '-L', '--retry', '3', '--retry-delay', '2', '-A', 'curl/8.7.1', '-o', dest, url], {
+    stdio: 'inherit',
+  });
+}
+
+function downloadWithFallback(urls, dest) {
+  let lastErr;
+  for (const url of urls) {
+    try {
+      downloadFile(url, dest);
+      return;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`Download failed from ${url}, trying next mirror if available...`);
+    }
+  }
+  throw lastErr;
 }
 
 function extractArchive(archivePath, destDir) {
@@ -201,7 +217,13 @@ function fetchExiftool() {
 
     if (platform === 'win32') {
       const zipPath = path.join(tmpDir, 'exiftool.zip');
-      downloadFile(`https://exiftool.org/exiftool-${ver}_64.zip`, zipPath);
+      downloadWithFallback(
+        [
+          `https://sourceforge.net/projects/exiftool/files/exiftool-${ver}_64.zip/download`,
+          `https://exiftool.org/exiftool-${ver}_64.zip`,
+        ],
+        zipPath,
+      );
       extractArchive(zipPath, tmpDir);
       const sub = fs
         .readdirSync(tmpDir)
