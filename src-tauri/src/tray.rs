@@ -40,6 +40,7 @@ pub fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
     let icon_bytes = include_bytes!("../icons/tray-icon.png");
     let icon = Image::from_bytes(icon_bytes)?;
 
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .icon(icon)
         .tooltip("TruongSync")

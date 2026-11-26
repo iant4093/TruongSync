@@ -77,6 +77,7 @@ fn seen_mounts_file() -> PathBuf {
     paths.data_dir.join("launch_agent_seen_mounts.json")
 }
 
+#[cfg(target_os = "macos")]
 fn snapshot_current_dcim_keys() -> HashSet<String> {
     truongsync_ingest::volumes::list_mounted_volumes()
         .into_iter()
