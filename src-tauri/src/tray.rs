@@ -64,6 +64,7 @@ pub fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
                 let app_quit = app.clone();
                 std::thread::spawn(move || {
                     if let Some(state) = app_quit.try_state::<crate::commands::AppState>() {
+                        state.begin_shutdown();
                         state.cancel_all_and_wait(std::time::Duration::from_secs(2));
                     }
                     app_quit.exit(0);

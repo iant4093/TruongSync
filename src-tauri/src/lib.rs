@@ -196,6 +196,7 @@ pub fn run() {
         }
         if let tauri::RunEvent::Exit = &event {
             if let Some(state) = app_handle.try_state::<commands::AppState>() {
+                state.begin_shutdown();
                 state.cancel_all_and_wait(std::time::Duration::from_secs(2));
             }
         }

@@ -331,7 +331,7 @@ pub fn import_rclone_config(source_conf: &Path, managed_conf: &Path) -> Result<V
         std::fs::canonicalize(source_conf),
         std::fs::canonicalize(managed_conf),
     ) {
-        if cs == cm {
+        if cs == cm && raw_txt.len() == txt.len() {
             enforce_private_conf_perms(managed_conf);
             return Ok(remotes);
         }

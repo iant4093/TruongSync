@@ -159,6 +159,12 @@ pub fn start_volume_watcher(app: AppHandle) {
                             );
                         }
                         if profile.schedule_mode == "on_connect" {
+                            if app
+                                .try_state::<AppState>()
+                                .is_some_and(|st| st.is_quiescing())
+                            {
+                                continue;
+                            }
                             if battery_blocked {
                                 if let Some(st) = app.try_state::<AppState>() {
                                     st.deferred_on_connect.lock().insert(profile.id.clone());
@@ -242,9 +248,12 @@ pub fn start_background_scheduler(app: AppHandle) {
             }
 
             if let Some((settings, cloud_profiles, ext_profiles)) = maybe_data {
+                let quiescing = app
+                    .try_state::<AppState>()
+                    .is_some_and(|st| st.is_quiescing());
                 let battery_blocked = !settings.sync_on_battery && on_batt;
 
-                if !battery_blocked {
+                if !battery_blocked && !quiescing {
                     let now_utc = Utc::now();
                     let now_local = Local::now();
                     let today_str = now_local.format("%Y-%m-%d").to_string();

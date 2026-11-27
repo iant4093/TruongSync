@@ -115,6 +115,12 @@ impl Drop for ProfileLockGuard {
             return;
         }
         if let (Some(spec), Some(app)) = (maybe_spec, self.followup_app.take()) {
+            if app
+                .try_state::<AppState>()
+                .is_some_and(|st| st.is_quiescing())
+            {
+                return;
+            }
             let pid = self.key.clone();
             let kind = self.kind;
             tauri::async_runtime::spawn(async move {
@@ -193,6 +199,7 @@ pub struct AppState {
     pub paths: StoragePaths,
     pub initial_import_volume: Mutex<Option<String>>,
     bootstrapped: AtomicBool,
+    quiescing: Arc<AtomicBool>,
     import_running: Arc<AtomicBool>,
     geotag_running: Arc<AtomicBool>,
     update_running: Arc<AtomicBool>,
@@ -210,6 +217,7 @@ impl AppState {
             paths,
             initial_import_volume: Mutex::new(initial_import_volume),
             bootstrapped: AtomicBool::new(false),
+            quiescing: Arc::new(AtomicBool::new(false)),
             import_running: Arc::new(AtomicBool::new(false)),
             geotag_running: Arc::new(AtomicBool::new(false)),
             update_running: Arc::new(AtomicBool::new(false)),
@@ -218,6 +226,24 @@ impl AppState {
             active_cancels: Arc::new(Mutex::new(HashMap::new())),
             cloud_locks: Arc::new(Mutex::new(ProfileLockTable::default())),
             external_locks: Arc::new(Mutex::new(ProfileLockTable::default())),
+        }
+    }
+
+    pub fn is_quiescing(&self) -> bool {
+        self.quiescing.load(Ordering::SeqCst)
+    }
+
+    /// Permanently marks the app as shutting down so no new background jobs/follow-ups start.
+    pub fn begin_shutdown(&self) {
+        self.quiescing.store(true, Ordering::SeqCst);
+    }
+
+    /// Temporarily quiesces new job/follow-up launches (e.g., while swapping the app bundle
+    /// during an in-app update), automatically clearing on Drop if installation fails.
+    pub fn enter_quiesce_guard(&self) -> FlagLockGuard {
+        self.quiescing.store(true, Ordering::SeqCst);
+        FlagLockGuard {
+            flag: Arc::clone(&self.quiescing),
         }
     }
 
@@ -331,6 +357,9 @@ impl AppState {
         let seq = CANCEL_SEQ.fetch_add(1, Ordering::Relaxed);
         let id = format!("{prefix}#{seq}");
         let token = CancellationToken::new();
+        if self.is_quiescing() {
+            token.cancel();
+        }
         self.active_cancels.lock().insert(id.clone(), token.clone());
         CancelRegistration {
             map: Arc::clone(&self.active_cancels),
@@ -344,6 +373,9 @@ impl AppState {
         job_id: String,
         token: CancellationToken,
     ) -> CancelRegistration {
+        if self.is_quiescing() {
+            token.cancel();
+        }
         self.active_cancels
             .lock()
             .insert(job_id.clone(), token.clone());
@@ -2563,6 +2595,7 @@ pub fn show_main_window_cmd(app: AppHandle) {
 
 #[tauri::command]
 pub fn quit_app_cmd(app: AppHandle, state: State<'_, AppState>) {
+    state.begin_shutdown();
     state.cancel_all_and_wait(std::time::Duration::from_secs(2));
     app.exit(0);
 }
@@ -2631,6 +2664,7 @@ pub async fn install_native_update(
         .updater_builder()
         .on_before_exit(move || {
             if let Some(st) = exit_handle.try_state::<AppState>() {
+                st.begin_shutdown();
                 st.cancel_all_and_wait(std::time::Duration::from_secs(3));
             }
             exit_handle.cleanup_before_exit();
@@ -2699,8 +2733,10 @@ pub async fn install_native_update(
         }
     };
 
-    // Stop active sidecar jobs (rclone / exiftool) BEFORE replacing the app bundle on disk
-    // so macOS bundle swaps never race running Perl/rclone children.
+    // Quiesce new background launches & stop active sidecar jobs (rclone / exiftool) BEFORE
+    // replacing the app bundle on disk so macOS bundle swaps never race running sidecars.
+    // The RAII guard automatically clears quiescing if `update.install(bytes)` returns `Err`.
+    let _quiesce_guard = state.enter_quiesce_guard();
     let cancel_app = app.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Some(st) = cancel_app.try_state::<AppState>() {

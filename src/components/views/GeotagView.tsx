@@ -103,6 +103,7 @@ export const GeotagView: React.FC = () => {
     if (!dir) return;
     const seq = ++folderScanSeqRef.current;
     previewSeqRef.current += 1;
+    setLoading(false);
     setTargetFolder(dir);
     setPlan(null);
     setResult(null);
@@ -240,7 +241,9 @@ export const GeotagView: React.FC = () => {
                   value={targetFolder}
                   placeholder="Choose any existing shoot folder…"
                   onChange={(e) => {
+                    folderScanSeqRef.current += 1;
                     previewSeqRef.current += 1;
+                    setLoading(false);
                     setTargetFolder(e.target.value);
                     setSuggestions([]);
                   }}

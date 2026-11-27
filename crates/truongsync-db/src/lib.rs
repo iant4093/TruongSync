@@ -947,7 +947,7 @@ impl DbHandle {
         {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO intentional_update_applied (update_id, profile_kind, profile_id, applied_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                 SELECT id, ?2, ?3, ?4 FROM intentional_updates WHERE id = ?1",
             )?;
             for id in update_ids {
                 stmt.execute(params![id, profile_kind, profile_id, now])?;

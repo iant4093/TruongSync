@@ -121,6 +121,7 @@ export const ImportView: React.FC = () => {
   const hydratedPresetIdRef = useRef<string | null>(null);
   const prevPresetRef = useRef<ImportPreset | null>(null);
   const scanSeqRef = useRef(0);
+  const planPreviewSeqRef = useRef(0);
 
   const defaultPreset = presets[0];
   const [selectedPresetId, setSelectedPresetId] = useState(defaultPreset?.id ?? '');
@@ -320,6 +321,7 @@ export const ImportView: React.FC = () => {
 
   // Invalidate stale dry-run plan preview whenever destination/naming inputs change
   useEffect(() => {
+    planPreviewSeqRef.current += 1;
     setPlanPreview(null);
   }, [destRoot, folderTemplate, dateFormat, rawFolder, jpegFolder, videoFolder, splitByDate, shootName, category, folderDate, dateAssignments]);
 
@@ -329,6 +331,7 @@ export const ImportView: React.FC = () => {
   ) => {
     if (running && !opts?.force) return;
     const seq = ++scanSeqRef.current;
+    planPreviewSeqRef.current += 1;
     if (path !== sourceRoot) {
       setGpxFiles([]);
       setGpxSuggestions([]);
@@ -476,6 +479,7 @@ export const ImportView: React.FC = () => {
 
   const handlePreviewPlan = async () => {
     if (!scan) return;
+    const seq = ++planPreviewSeqRef.current;
     try {
       const items = await api.previewImportPlan({
         scan,
@@ -487,9 +491,13 @@ export const ImportView: React.FC = () => {
         videoFolder,
         assignments: buildAssignments(),
       });
-      setPlanPreview(items);
+      if (planPreviewSeqRef.current === seq) {
+        setPlanPreview(items);
+      }
     } catch (err) {
-      notifyError(err, 'Preview failed');
+      if (planPreviewSeqRef.current === seq) {
+        notifyError(err, 'Preview failed');
+      }
     }
   };
 
