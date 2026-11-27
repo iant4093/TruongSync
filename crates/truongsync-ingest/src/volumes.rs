@@ -735,10 +735,7 @@ pub fn eject_volume(mount_path: &Path) -> Result<()> {
             {
                 let desc = unsafe { &*(desc_buf.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>()) };
                 if desc.RemovableMedia
-                    || matches!(
-                        desc.BusType,
-                        BusTypeUsb | BusTypeSd | BusTypeMmc | BusType1394
-                    )
+                    || [BusTypeUsb, BusTypeSd, BusTypeMmc, BusType1394].contains(&desc.BusType)
                 {
                     is_external_bus = true;
                 }
