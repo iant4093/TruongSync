@@ -379,7 +379,7 @@ struct WorkerOutcome {
 }
 
 struct ProgressGate {
-    last_emit: Instant,
+    last_emit: Option<Instant>,
     last_done: usize,
 }
 
@@ -412,10 +412,13 @@ where
         if let Ok(mut gate) = progress_gate.lock() {
             let is_final = done >= total;
             if done > gate.last_done
-                && (is_final || gate.last_emit.elapsed() >= Duration::from_millis(80))
+                && (is_final
+                    || gate
+                        .last_emit
+                        .is_none_or(|t| t.elapsed() >= Duration::from_millis(80)))
             {
                 gate.last_done = done;
-                gate.last_emit = Instant::now();
+                gate.last_emit = Some(Instant::now());
                 on_progress(done, total, filename);
             }
         }
@@ -626,6 +629,10 @@ where
         args.push(safe_path_str);
         args.push(format!("-execute{seq}"));
 
+        if cancel.is_cancelled() {
+            was_cancelled = true;
+            break;
+        }
         let payload = format!("{}\n", args.join("\n"));
         in_flight = Some((item.path.clone(), canon_path.clone(), pre_md5.clone()));
         if let Err(e) = stdin
@@ -943,7 +950,7 @@ where
 
     let done_counter = std::sync::atomic::AtomicUsize::new(0);
     let progress_gate = std::sync::Mutex::new(ProgressGate {
-        last_emit: Instant::now() - Duration::from_secs(1),
+        last_emit: None,
         last_done: 0,
     });
 
@@ -1049,7 +1056,7 @@ where
             if let Ok(mut gate) = progress_gate.lock() {
                 if done > gate.last_done && done >= total {
                     gate.last_done = done;
-                    gate.last_emit = Instant::now();
+                    gate.last_emit = Some(Instant::now());
                     on_progress(
                         done,
                         total,

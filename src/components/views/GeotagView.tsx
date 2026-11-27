@@ -55,12 +55,18 @@ export const GeotagView: React.FC = () => {
   );
   const userEditedGapRef = useRef(false);
   const folderScanSeqRef = useRef(0);
+  const previewSeqRef = useRef(0);
   const [overwriteExisting, setOverwriteExisting] = useState(false);
   const [recordBackfill, setRecordBackfill] = useState(true);
 
-  const clockOffsetSecs = Number.isFinite(Number(clockOffsetText))
-    ? Math.max(-86400, Math.min(86400, Math.trunc(Number(clockOffsetText))))
-    : 0;
+  const clockTrim = clockOffsetText.trim();
+  const clockParsed = clockTrim === '' ? 0 : Number(clockTrim);
+  const clockOffsetValid =
+    (clockTrim === '' || /^[+-]?\d+$/.test(clockTrim)) &&
+    Number.isInteger(clockParsed) &&
+    clockParsed >= -86400 &&
+    clockParsed <= 86400;
+  const clockOffsetSecs = clockOffsetValid ? clockParsed : 0;
   const maxGapParsed = Number(maxGapText.trim());
   const maxGapValid =
     Number.isInteger(maxGapParsed) && maxGapParsed >= 1 && maxGapParsed <= 1440;
@@ -96,6 +102,7 @@ export const GeotagView: React.FC = () => {
     const dir = await pickDirectory('Select Shoot Folder to Geotag');
     if (!dir) return;
     const seq = ++folderScanSeqRef.current;
+    previewSeqRef.current += 1;
     setTargetFolder(dir);
     setPlan(null);
     setResult(null);
@@ -119,6 +126,11 @@ export const GeotagView: React.FC = () => {
       notifyError('Choose both a target shoot folder and at least one .gpx track.');
       return;
     }
+    if (!clockOffsetValid || !maxGapValid) {
+      notifyError('Enter valid camera clock offset (-86400 to 86400s) and max gap (1–1440 min).');
+      return;
+    }
+    const seq = ++previewSeqRef.current;
     const sig = currentSignature;
     setLoading(true);
     setResult(null);
@@ -130,12 +142,17 @@ export const GeotagView: React.FC = () => {
         maxGapSecs: Math.max(60, maxGapMins * 60),
         overwriteExisting,
       });
+      if (previewSeqRef.current !== seq) return;
       setPlan(next);
       setPreviewSignature(sig);
     } catch (err) {
-      notifyError(err, 'GPX preview failed');
+      if (previewSeqRef.current === seq) {
+        notifyError(err, 'GPX preview failed');
+      }
     } finally {
-      setLoading(false);
+      if (previewSeqRef.current === seq) {
+        setLoading(false);
+      }
     }
   };
 
@@ -223,11 +240,17 @@ export const GeotagView: React.FC = () => {
                   value={targetFolder}
                   placeholder="Choose any existing shoot folder…"
                   onChange={(e) => {
+                    previewSeqRef.current += 1;
                     setTargetFolder(e.target.value);
                     setSuggestions([]);
                   }}
                 />
-                <button type="button" className="button" onClick={() => void pickTargetFolder()}>
+                <button
+                  type="button"
+                  className="button"
+                  disabled={writing}
+                  onClick={() => void pickTargetFolder()}
+                >
                   <FolderOpen size={14} /> Browse
                 </button>
               </div>
@@ -240,6 +263,7 @@ export const GeotagView: React.FC = () => {
                   type="button"
                   className="button"
                   style={{ flex: 1 }}
+                  disabled={writing}
                   onClick={async () => {
                     const files = await pickFiles('Select GPX File(s)', ['gpx'], true);
                     if (files.length > 0) {
@@ -250,7 +274,12 @@ export const GeotagView: React.FC = () => {
                   <MapPin size={14} /> {gpxFiles.length > 0 ? `${gpxFiles.length} GPX selected` : 'Select .gpx files…'}
                 </button>
                 {gpxFiles.length > 0 && (
-                  <button type="button" className="button button-quiet" onClick={() => setGpxFiles([])}>
+                  <button
+                    type="button"
+                    className="button button-quiet"
+                    disabled={writing}
+                    onClick={() => setGpxFiles([])}
+                  >
                     Clear
                   </button>
                 )}
@@ -312,6 +341,11 @@ export const GeotagView: React.FC = () => {
                 value={clockOffsetText}
                 onChange={(e) => setClockOffsetText(e.target.value)}
               />
+              {!clockOffsetValid && (
+                <span style={{ color: 'var(--danger-text)', fontSize: 11, marginTop: 3 }}>
+                  Enter a whole number between -86400 and 86400 seconds.
+                </span>
+              )}
             </div>
             <div className="settings-field" style={{ marginBottom: 0 }}>
               <span>Max Interpolation Gap (minutes)</span>
@@ -352,7 +386,14 @@ export const GeotagView: React.FC = () => {
             <button
               type="button"
               className="button button-primary"
-              disabled={loading || writing || !targetFolder.trim() || gpxFiles.length === 0 || !maxGapValid}
+              disabled={
+                loading ||
+                writing ||
+                !targetFolder.trim() ||
+                gpxFiles.length === 0 ||
+                !maxGapValid ||
+                !clockOffsetValid
+              }
               onClick={() => void handlePreview()}
             >
               <Play size={14} /> {loading ? 'Matching…' : 'Match & Preview on Map'}
@@ -424,7 +465,14 @@ export const GeotagView: React.FC = () => {
             <button
               type="button"
               className="button button-primary"
-              disabled={writing || isPlanStale || !maxGapValid || plan.matched_count === 0 || !tools?.exiftool.available}
+              disabled={
+                writing ||
+                isPlanStale ||
+                !maxGapValid ||
+                !clockOffsetValid ||
+                plan.matched_count === 0 ||
+                !tools?.exiftool.available
+              }
               onClick={() => void handleWrite()}
             >
               <MapPin size={14} />

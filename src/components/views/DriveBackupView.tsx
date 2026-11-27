@@ -9,7 +9,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { api, formatBytes, pickDirectory } from '../../lib/tauri';
-import { confirmAction, notifyError, notifySuccess } from '../../store/feedback';
+import { confirmAction, notifyError, notifyInfo, notifySuccess } from '../../store/feedback';
 import { useSyncStore } from '../../store/useSyncStore';
 import type { ExternalProfile, ExternalVerifyReport } from '../../types/api';
 import { Dropdown } from '../Dropdown';
@@ -172,29 +172,38 @@ export const DriveBackupView: React.FC = () => {
       const freshProfile = useSyncStore
         .getState()
         .externalProfiles.find((e) => e.id === profileId);
-      const superseded = Boolean(
-        freshProfile?.last_sync_at &&
-          Date.parse(freshProfile.last_sync_at) > Date.parse(rep.checked_at),
-      );
+      const checkedMs = Date.parse(rep.checked_at);
+      const syncMs = freshProfile?.last_sync_at ? Date.parse(freshProfile.last_sync_at) : Number.NaN;
+      const verifyMs = freshProfile?.last_verify_at
+        ? Date.parse(freshProfile.last_verify_at)
+        : Number.NaN;
+      const superseded =
+        Boolean(freshProfile) &&
+        Number.isFinite(checkedMs) &&
+        ((Number.isFinite(syncMs) && syncMs >= checkedMs) ||
+          (Number.isFinite(verifyMs) && verifyMs > checkedMs));
       if (freshProfile && !superseded) {
         setReportSyncStamps((prev) => ({
           ...prev,
           [profileId]: externalVerifyStamp(freshProfile),
         }));
         setReports((prev) => ({ ...prev, [profileId]: rep }));
-      } else if (superseded) {
+        if (!rep.volume_connected) {
+          notifyError('External drive is not currently connected.');
+        } else {
+          notifySuccess(
+            `Verified: ${rep.up_to_date_count.toLocaleString()} up to date, ↑${rep.to_push.length} to drive, ↓${rep.to_pull.length} from drive.`,
+          );
+        }
+      } else {
         setReports((prev) => {
           const next = { ...prev };
           delete next[profileId];
           return next;
         });
-      }
-      if (!rep.volume_connected) {
-        notifyError('External drive is not currently connected.');
-      } else {
-        notifySuccess(
-          `Verified: ${rep.up_to_date_count.toLocaleString()} up to date, ↑${rep.to_push.length} to drive, ↓${rep.to_pull.length} from drive.`,
-        );
+        if (superseded) {
+          notifyInfo('A newer sync or verify finished for this drive; refreshed drive status.');
+        }
       }
     } catch (err) {
       notifyError(err, 'Verify failed');
@@ -319,7 +328,12 @@ export const DriveBackupView: React.FC = () => {
                     <button
                       key={v.mount_path}
                       type="button"
-                      className={`chip-button ${editing.volume_uuid === v.volume_uuid ? 'is-selected' : ''}`}
+                      className={`chip-button ${
+                        Boolean(editing.volume_uuid) &&
+                        editing.volume_uuid.toLowerCase() === v.volume_uuid.toLowerCase()
+                          ? 'is-selected'
+                          : ''
+                      }`}
                       onClick={() =>
                         setEditing({
                           ...editing,

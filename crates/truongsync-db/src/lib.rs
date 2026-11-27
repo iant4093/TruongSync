@@ -20,7 +20,7 @@ pub struct DbHandle {
 
 impl DbHandle {
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)

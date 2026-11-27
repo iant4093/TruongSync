@@ -200,6 +200,7 @@ export const SettingsView: React.FC = () => {
             label="Launch TruongSync in menu bar / tray at login"
             description="Keeps background volume detection and scheduled syncs running quietly with minimal idle footprint."
             checked={autostart}
+            disabled={autostartBusy}
             onChange={(v) => void handleAutostartToggle(v)}
           />
           <ToggleRow
@@ -222,6 +223,7 @@ export const SettingsView: React.FC = () => {
                 : 'Registers a per-user HKCU Windows AutoPlay handler for memory cards (no admin required).'
             }
             checked={draft.os_native_auto_launch}
+            disabled={osAutoLaunchBusy}
             onChange={(v) => void handleOsNativeAutoLaunch(v)}
           />
         </div>
@@ -234,11 +236,10 @@ export const SettingsView: React.FC = () => {
           <div className="settings-field">
             <span>Google Drive Bandwidth Limit (MB/s — leave empty for Unlimited)</span>
             <input
-              type="number"
+              type="text"
+              inputMode="decimal"
               className="text-input"
               placeholder="Unlimited"
-              min={0}
-              step={1}
               value={bandwidthText}
               onChange={(e) => {
                 dirtyRef.current = true;

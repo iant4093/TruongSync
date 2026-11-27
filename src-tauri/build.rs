@@ -16,6 +16,7 @@ const APP_COMMANDS: &[&str] = &[
     "preview_import_plan",
     "run_import_pipeline",
     "cancel_active_job",
+    "cancel_oauth",
     "find_matching_gpx",
     "preview_geotag",
     "run_geotag",

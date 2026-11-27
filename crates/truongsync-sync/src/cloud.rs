@@ -308,8 +308,9 @@ pub fn import_rclone_config(source_conf: &Path, managed_conf: &Path) -> Result<V
         ));
     }
     let contents = std::fs::read(source_conf)?;
-    let txt = std::str::from_utf8(&contents)
+    let raw_txt = std::str::from_utf8(&contents)
         .map_err(|_| anyhow!("Selected rclone.conf is not valid UTF-8 INI text."))?;
+    let txt = raw_txt.strip_prefix('\u{feff}').unwrap_or(raw_txt);
     let mut remotes = Vec::new();
     for line in txt.lines() {
         let t = line.trim();
@@ -342,7 +343,7 @@ pub fn import_rclone_config(source_conf: &Path, managed_conf: &Path) -> Result<V
 
     let mut tmp = NamedTempFile::new_in(parent)?;
     enforce_private_conf_perms(tmp.path());
-    tmp.write_all(&contents)?;
+    tmp.write_all(txt.as_bytes())?;
     tmp.flush()?;
     tmp.persist(managed_conf)
         .map_err(|e| anyhow!("Failed to install managed rclone.conf: {}", e.error))?;
@@ -361,9 +362,10 @@ fn parse_remote_names_from_conf(conf_path: &Path) -> Vec<String> {
     if meta.len() > 1024 * 1024 {
         return Vec::new();
     }
-    let Ok(txt) = std::fs::read_to_string(conf_path) else {
+    let Ok(raw_txt) = std::fs::read_to_string(conf_path) else {
         return Vec::new();
     };
+    let txt = raw_txt.strip_prefix('\u{feff}').unwrap_or(&raw_txt);
     txt.lines()
         .filter_map(|line| {
             let t = line.trim();

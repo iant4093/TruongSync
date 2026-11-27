@@ -2325,6 +2325,9 @@ pub fn save_external_profile(
         .db
         .upsert_external_profile(&profile)
         .map_err(map_err)?;
+    if !profile.enabled || profile.schedule_mode != "on_connect" {
+        state.deferred_on_connect.lock().remove(&saved);
+    }
     if !profile.enabled {
         if let Some(ref g) = edit_lock {
             g.suppress_followup_on_cancel();
@@ -2341,6 +2344,7 @@ pub fn delete_external_profile(state: State<'_, AppState>, id: String) -> Result
                 .into(),
         );
     };
+    state.deferred_on_connect.lock().remove(&id);
     state.db.delete_external_profile(&id).map_err(map_err)
 }
 
@@ -2652,8 +2656,8 @@ pub async fn install_native_update(
     let dl_counter = Arc::clone(&downloaded);
     let emit_counter = Arc::clone(&last_emitted);
 
-    if let Err(e) = update
-        .download_and_install(
+    let bytes = match update
+        .download(
             move |chunk_len, content_length| {
                 let total_dl =
                     dl_counter.fetch_add(chunk_len as u64, Ordering::Relaxed) + chunk_len as u64;
@@ -2688,10 +2692,27 @@ pub async fn install_native_update(
         )
         .await
     {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = std::fs::remove_file(&marker_path);
+            return Err(format!("Failed to download update: {e}"));
+        }
+    };
+
+    // Stop active sidecar jobs (rclone / exiftool) BEFORE replacing the app bundle on disk
+    // so macOS bundle swaps never race running Perl/rclone children.
+    let cancel_app = app.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(st) = cancel_app.try_state::<AppState>() {
+            st.cancel_all_and_wait(std::time::Duration::from_secs(3));
+        }
+    })
+    .await;
+
+    if let Err(e) = update.install(bytes) {
         let _ = std::fs::remove_file(&marker_path);
         return Err(format!("Failed to install update: {e}"));
     }
 
-    state.cancel_all_and_wait(std::time::Duration::from_secs(3));
     app.restart();
 }

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useId, useRef } from 'react';
 import { X } from 'lucide-react';
 import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../lib/escapeStack';
 import { TOAST_ERROR_MS, TOAST_MS, useFeedback, type Toast } from '../store/feedback';
@@ -44,21 +44,38 @@ const ToastItem: React.FC<{ toast: Toast }> = ({ toast }) => {
 const ConfirmDialog: React.FC = () => {
   const request = useFeedback((s) => s.confirm);
   const answer = useFeedback((s) => s.answer);
+  const titleId = useId();
+  const descId = useId();
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const confirmRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     if (!request) return;
+    const prevFocused =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const layer = pushEscapeLayer();
     cancelRef.current?.focus();
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && isTopEscapeLayer(layer)) {
         event.preventDefault();
         answer(false);
+      } else if (event.key === 'Tab') {
+        const focusables = [cancelRef.current, confirmRef.current].filter(
+          (el): el is HTMLButtonElement => Boolean(el),
+        );
+        if (focusables.length === 0) return;
+        event.preventDefault();
+        const idx = focusables.indexOf(document.activeElement as HTMLButtonElement);
+        const nextIdx = event.shiftKey
+          ? (idx <= 0 ? focusables.length - 1 : idx - 1)
+          : (idx + 1) % focusables.length;
+        focusables[nextIdx].focus();
       }
     };
     document.addEventListener('keydown', onKey, true);
     return () => {
       document.removeEventListener('keydown', onKey, true);
       popEscapeLayer(layer);
+      prevFocused?.focus();
     };
   }, [request, answer]);
 
@@ -69,15 +86,22 @@ const ConfirmDialog: React.FC = () => {
         className="panel confirm-dialog"
         role="alertdialog"
         aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={request.message ? descId : undefined}
         onClick={(e) => e.stopPropagation()}
       >
-        <h3>{request.title}</h3>
-        {request.message && <p>{request.message}</p>}
+        <h3 id={titleId}>{request.title}</h3>
+        {request.message && <p id={descId}>{request.message}</p>}
         <div className="confirm-actions">
           <button type="button" ref={cancelRef} className="button" onClick={() => answer(false)}>
             Cancel
           </button>
-          <button type="button" className="button button-primary" onClick={() => answer(true)}>
+          <button
+            type="button"
+            ref={confirmRef}
+            className="button button-primary"
+            onClick={() => answer(true)}
+          >
             {request.confirmLabel}
           </button>
         </div>

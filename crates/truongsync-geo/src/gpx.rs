@@ -44,8 +44,9 @@ pub struct WatchedGpxMatch {
 
 /// Parses a single `.gpx` file into time-ordered track segments.
 pub fn parse_gpx_file(path: &Path) -> Result<Vec<TrackSegment>> {
-    let xml = std::fs::read_to_string(path)
+    let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read GPX file {}", path.display()))?;
+    let xml = String::from_utf8_lossy(&bytes);
     parse_gpx_str(&xml).with_context(|| format!("failed to parse GPX XML {}", path.display()))
 }
 

@@ -316,9 +316,15 @@ pub fn start_background_scheduler(app: AppHandle) {
                         .filter(|p| p.enabled)
                         .filter_map(|p| {
                             let key = format!("external:{}", p.id);
-                            let was_deferred = app
+                            let mut was_deferred = app
                                 .try_state::<AppState>()
                                 .is_some_and(|st| st.deferred_on_connect.lock().contains(&p.id));
+                            if was_deferred && p.schedule_mode != "on_connect" {
+                                if let Some(st) = app.try_state::<AppState>() {
+                                    st.deferred_on_connect.lock().remove(&p.id);
+                                }
+                                was_deferred = false;
+                            }
                             let locked = app
                                 .try_state::<AppState>()
                                 .is_some_and(|st| st.is_external_locked(&p.id));

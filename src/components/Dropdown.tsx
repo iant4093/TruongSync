@@ -114,6 +114,8 @@ export function Dropdown<T extends string | number>({
     } else if (open && (event.key === 'Enter' || event.key === ' ')) {
       event.preventDefault();
       choose(active);
+    } else if (open && event.key === 'Tab') {
+      setOpen(false);
     }
   };
 

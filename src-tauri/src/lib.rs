@@ -188,12 +188,16 @@ pub fn run() {
         if let tauri::RunEvent::Reopen {
             has_visible_windows,
             ..
-        } = event
+        } = &event
         {
             if !has_visible_windows {
                 tray::show_main_window(app_handle);
             }
         }
-        let _ = (app_handle, event);
+        if let tauri::RunEvent::Exit = &event {
+            if let Some(state) = app_handle.try_state::<commands::AppState>() {
+                state.cancel_all_and_wait(std::time::Duration::from_secs(2));
+            }
+        }
     });
 }

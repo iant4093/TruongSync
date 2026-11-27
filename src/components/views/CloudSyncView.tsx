@@ -11,7 +11,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import { api, formatBytes, pickDirectory, pickFiles } from '../../lib/tauri';
-import { confirmAction, notifyError, notifySuccess } from '../../store/feedback';
+import { confirmAction, notifyError, notifyInfo, notifySuccess } from '../../store/feedback';
 import { useSyncStore } from '../../store/useSyncStore';
 import type { CloudProfile, CloudVerifyReport } from '../../types/api';
 import { Dropdown } from '../Dropdown';
@@ -184,23 +184,32 @@ export const CloudSyncView: React.FC = () => {
       const rep = await api.verifyCloud(profileId, deepMd5);
       await refreshProfiles();
       const freshProfile = useSyncStore.getState().cloudProfiles.find((c) => c.id === profileId);
-      const superseded = Boolean(
-        freshProfile?.last_sync_at &&
-          Date.parse(freshProfile.last_sync_at) > Date.parse(rep.checked_at),
-      );
+      const checkedMs = Date.parse(rep.checked_at);
+      const syncMs = freshProfile?.last_sync_at ? Date.parse(freshProfile.last_sync_at) : Number.NaN;
+      const verifyMs = freshProfile?.last_verify_at
+        ? Date.parse(freshProfile.last_verify_at)
+        : Number.NaN;
+      const superseded =
+        Boolean(freshProfile) &&
+        Number.isFinite(checkedMs) &&
+        ((Number.isFinite(syncMs) && syncMs >= checkedMs) ||
+          (Number.isFinite(verifyMs) && verifyMs > checkedMs));
       if (freshProfile && !superseded) {
         setReportSyncStamps((prev) => ({ ...prev, [profileId]: cloudVerifyStamp(freshProfile) }));
         setVerifyReports((prev) => ({ ...prev, [profileId]: rep }));
-      } else if (superseded) {
+        notifySuccess(
+          `Verified: ${rep.up_to_date_count.toLocaleString()} up to date, ↑${rep.missing_on_remote.length} upload, ↓${rep.missing_on_local.length} download.`,
+        );
+      } else {
         setVerifyReports((prev) => {
           const next = { ...prev };
           delete next[profileId];
           return next;
         });
+        if (superseded) {
+          notifyInfo('A newer sync or verify finished for this profile; refreshed profile status.');
+        }
       }
-      notifySuccess(
-        `Verified: ${rep.up_to_date_count.toLocaleString()} up to date, ↑${rep.missing_on_remote.length} upload, ↓${rep.missing_on_local.length} download.`,
-      );
     } catch (err) {
       notifyError(err, 'Verify failed');
     } finally {
@@ -359,7 +368,11 @@ export const CloudSyncView: React.FC = () => {
                   <button
                     type="button"
                     className="button button-danger"
-                    onClick={() => void api.cancelOAuth()}
+                    onClick={() =>
+                      void api
+                        .cancelOAuth()
+                        .catch((err) => notifyError(err, 'Could not cancel Google Drive sign-in'))
+                    }
                   >
                     Cancel Sign-In
                   </button>

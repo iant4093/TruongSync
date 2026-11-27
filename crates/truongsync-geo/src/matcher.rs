@@ -418,7 +418,7 @@ pub fn build_geotag_plan(
         }
     }
 
-    if clock_offset_secs.abs() > 31_536_000 {
+    if !(-31_536_000..=31_536_000).contains(&clock_offset_secs) {
         return Err(anyhow::anyhow!(
             "Camera clock offset must be within ±365 days (±31,536,000 seconds)."
         ));

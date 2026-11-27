@@ -136,6 +136,7 @@ export const ImportView: React.FC = () => {
   const [scan, setScan] = useState<CardScanResult | null>(null);
   const [scanning, setScanning] = useState(false);
   const [preflight, setPreflight] = useState<PreflightReport | null>(null);
+  const [preflightPending, setPreflightPending] = useState(false);
   const [planPreview, setPlanPreview] = useState<ImportPlanItem[] | null>(null);
 
   // Single-shoot & Multi-day split state
@@ -162,7 +163,14 @@ export const ImportView: React.FC = () => {
   const [gpxFiles, setGpxFiles] = useState<string[]>([]);
   const [gpxSuggestions, setGpxSuggestions] = useState<WatchedGpxMatch[]>([]);
   const [clockOffsetText, setClockOffsetText] = useState('0');
-  const clockOffsetSecs = Number.isFinite(Number(clockOffsetText)) ? Math.trunc(Number(clockOffsetText)) : 0;
+  const clockTrim = clockOffsetText.trim();
+  const clockParsed = clockTrim === '' ? 0 : Number(clockTrim);
+  const clockOffsetValid =
+    (clockTrim === '' || /^[+-]?\d+$/.test(clockTrim)) &&
+    Number.isInteger(clockParsed) &&
+    clockParsed >= -86400 &&
+    clockParsed <= 86400;
+  const clockOffsetSecs = clockOffsetValid ? clockParsed : 0;
   const [ejectAfter, setEjectAfter] = useState(false);
   const [selectedCloudIds, setSelectedCloudIds] = useState<string[]>([]);
   const [selectedExternalIds, setSelectedExternalIds] = useState<string[]>([]);
@@ -282,16 +290,27 @@ export const ImportView: React.FC = () => {
   useEffect(() => {
     if (!scan) {
       setPreflight(null);
+      setPreflightPending(false);
       return;
     }
     let cancelled = false;
+    setPreflightPending(true);
     const timer = window.setTimeout(() => {
       void api
         .preflightImport(scan, destRoot, transferMode === 'move')
         .then((rep) => {
-          if (!cancelled) setPreflight(rep);
+          if (!cancelled) {
+            setPreflight(rep);
+            setPreflightPending(false);
+          }
         })
-        .catch(() => {});
+        .catch((err) => {
+          if (!cancelled) {
+            setPreflight(null);
+            setPreflightPending(false);
+            notifyError(err, 'Pre-flight check failed');
+          }
+        });
     }, 200);
     return () => {
       cancelled = true;
@@ -310,6 +329,10 @@ export const ImportView: React.FC = () => {
   ) => {
     if (running && !opts?.force) return;
     const seq = ++scanSeqRef.current;
+    if (path !== sourceRoot) {
+      setGpxFiles([]);
+      setGpxSuggestions([]);
+    }
     setSourceRoot(path);
     setScan(null);
     setScanning(true);
@@ -496,6 +519,10 @@ export const ImportView: React.FC = () => {
       notifyError('Attach at least one .gpx file or turn off inline geotagging before importing.');
       return;
     }
+    if (geotagEnabled && !clockOffsetValid) {
+      notifyError('Camera clock offset must be a whole number between -86400 and 86400 seconds.');
+      return;
+    }
     setRunning(true);
     setLastSummary(null);
     try {
@@ -544,6 +571,8 @@ export const ImportView: React.FC = () => {
         setSourceRoot('');
         setPreflight(null);
         setPlanPreview(null);
+        setGpxFiles([]);
+        setGpxSuggestions([]);
       } else if (transferMode === 'move') {
         await handleScanSource(sourceRoot, {
           preserveSummary: true,
@@ -578,7 +607,7 @@ export const ImportView: React.FC = () => {
     return { count, bytes };
   }, [scan, isMultiDaySplit, dateAssignments]);
   const totalCount = selectedTotals.count;
-  const hasBlockers = (preflight?.blockers.length ?? 0) > 0;
+  const hasBlockers = preflightPending || !preflight || (preflight.blockers.length ?? 0) > 0;
 
   return (
     <div className="view-content">
@@ -593,6 +622,7 @@ export const ImportView: React.FC = () => {
             <button
               type="button"
               className="button"
+              disabled={running}
               onClick={async () => {
                 const picked = await pickDirectory('Choose SD Card or Source Folder');
                 if (picked) void handleScanSource(picked);
@@ -618,6 +648,7 @@ export const ImportView: React.FC = () => {
             <button
               type="button"
               className="button button-primary"
+              disabled={running}
               onClick={async () => {
                 const picked = await pickDirectory('Choose Source Media Folder');
                 if (picked) void handleScanSource(picked);
@@ -636,6 +667,7 @@ export const ImportView: React.FC = () => {
                 key={v.mount_path}
                 type="button"
                 className={`volume-card ${active ? 'is-selected' : ''}`}
+                disabled={running}
                 onClick={() => void handleScanSource(v.mount_path)}
               >
                 <div className="row-between">
@@ -917,7 +949,12 @@ export const ImportView: React.FC = () => {
                   <button type="button" className="button button-primary" onClick={() => void handleCreateCategory()}>
                     Create
                   </button>
-                  <button type="button" className="icon-button" onClick={() => setNewCatOpen(false)}>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    aria-label="Cancel new category"
+                    onClick={() => setNewCatOpen(false)}
+                  >
                     <X size={14} />
                   </button>
                 </div>
@@ -1008,6 +1045,7 @@ export const ImportView: React.FC = () => {
                           {f.split(/[\\/]/).pop()}
                           <button
                             type="button"
+                            aria-label={`Remove ${f.split(/[\\/]/).pop()}`}
                             style={{ background: 'none', border: 0, color: 'inherit', padding: 0, marginLeft: 4 }}
                             onClick={() => setGpxFiles((prev) => prev.filter((x) => x !== f))}
                           >
@@ -1017,7 +1055,7 @@ export const ImportView: React.FC = () => {
                       ))}
                     </div>
                   )}
-                  <div className="row">
+                  <div className="row-wrap">
                     <span className="muted">Camera clock offset (seconds):</span>
                     <input
                       type="text"
@@ -1027,6 +1065,11 @@ export const ImportView: React.FC = () => {
                       value={clockOffsetText}
                       onChange={(e) => setClockOffsetText(e.target.value)}
                     />
+                    {!clockOffsetValid && (
+                      <span style={{ color: 'var(--danger-text)', fontSize: 11 }}>
+                        Enter a whole number (-86400 to 86400).
+                      </span>
+                    )}
                   </div>
                 </div>
               )}

@@ -11,7 +11,6 @@ import { isTauri } from '../lib/tauri';
 import { useSyncStore } from '../store/useSyncStore';
 import type { NavTab } from '../types/api';
 import { StatusBanner } from './Feedback';
-import { isWindowsPlatform } from './WindowControls';
 
 const NAV_ITEMS: ReadonlyArray<
   readonly [NavTab, string, React.ComponentType<{ size?: number; strokeWidth?: number }>]
@@ -24,7 +23,6 @@ const NAV_ITEMS: ReadonlyArray<
 ];
 
 const nativeMacTitlebar = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform);
-const windowsCaption = !nativeMacTitlebar && isWindowsPlatform();
 
 export const Sidebar: React.FC = () => {
   const activeNav = useSyncStore((s) => s.activeNav);
@@ -43,7 +41,7 @@ export const Sidebar: React.FC = () => {
 
   return (
     <aside className="app-sidebar">
-      {isTauri() && !windowsCaption && <div className="sidebar-titlebar" data-tauri-drag-region />}
+      {isTauri() && nativeMacTitlebar && <div className="sidebar-titlebar" data-tauri-drag-region />}
       <div className="app-brand" data-tauri-drag-region>
         <img src="/app-icon.png" width={23} height={23} alt="" />
         <span>TruongSync</span>

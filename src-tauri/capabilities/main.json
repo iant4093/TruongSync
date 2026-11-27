@@ -33,6 +33,7 @@
     "allow-preview-import-plan",
     "allow-run-import-pipeline",
     "allow-cancel-active-job",
+    "allow-cancel-oauth",
     "allow-find-matching-gpx",
     "allow-preview-geotag",
     "allow-run-geotag",

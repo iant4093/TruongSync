@@ -213,12 +213,29 @@ fn read_video_capture_time(
     path: &Path,
     parser: &mut MediaParser,
 ) -> Option<(NaiveDate, DateTime<Utc>)> {
+    use chrono::Datelike;
     let ms = MediaSource::open(path).ok()?;
     let info: nom_exif::TrackInfo = parser.parse_track(ms).ok()?;
     let val = info.get(nom_exif::TrackInfoTag::CreateDate)?;
     match val {
-        EntryValue::DateTime(dt) => Some((dt.date_naive(), dt.with_timezone(&Utc))),
+        EntryValue::DateTime(dt) => {
+            // Reject zero-epoch MP4 mvhd sentinel timestamps (1904-01-01) so we fall back to mtime.
+            if dt.year() < 1970 {
+                return None;
+            }
+            // Per ISO 14496-12, raw `mvhd` creation_time is UTC (+00:00) without local TZ;
+            // convert UTC-offset timestamps to local date so evening shoots match EXIF photo dates.
+            let local_date = if dt.offset().local_minus_utc() == 0 {
+                dt.with_timezone(&Local).date_naive()
+            } else {
+                dt.date_naive()
+            };
+            Some((local_date, dt.with_timezone(&Utc)))
+        }
         EntryValue::NaiveDateTime(naive) => {
+            if naive.year() < 1970 {
+                return None;
+            }
             Some((naive.date(), resolve_local_naive_to_utc(*naive)))
         }
         _ => None,
@@ -519,7 +536,9 @@ pub fn run_preflight_checks(
             (None, false)
         }
         None => {
-            blockers.push("Choose a destination library root folder first.".into());
+            if dest_trimmed.is_empty() {
+                blockers.push("Choose a destination library root folder first.".into());
+            }
             (None, false)
         }
     };
@@ -698,6 +717,7 @@ where
     let files_skipped = Arc::new(AtomicUsize::new(0));
     let files_failed = Arc::new(AtomicUsize::new(0));
     let bytes_done = Arc::new(AtomicU64::new(0));
+    let bytes_moved = Arc::new(AtomicU64::new(0));
     let failures: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let dest_photos: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let dup_photos: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -719,7 +739,7 @@ where
         if cancel.is_cancelled() {
             break;
         }
-        let pending_unlinks: Mutex<Vec<(PathBuf, PathBuf, bool)>> = Mutex::new(Vec::new());
+        let pending_unlinks: Mutex<Vec<(PathBuf, PathBuf, bool, u64)>> = Mutex::new(Vec::new());
         pool.install(|| {
             chunk.par_iter().for_each_init(
                 || vec![0u8; 2 * 1024 * 1024],
@@ -748,9 +768,11 @@ where
                                     src.to_path_buf(),
                                     final_dst,
                                     is_photo,
+                                    nbytes,
                                 ));
                             } else {
                                 files_moved.fetch_add(1, Ordering::Relaxed);
+                                bytes_moved.fetch_add(nbytes, Ordering::Relaxed);
                                 if is_photo {
                                     dest_photos
                                         .lock()
@@ -816,7 +838,7 @@ where
             let unlinks = pending_unlinks.into_inner();
             if !unlinks.is_empty() {
                 let mut synced_dirs: HashMap<PathBuf, Result<(), String>> = HashMap::new();
-                for (_, final_dst, _) in &unlinks {
+                for (_, final_dst, _, _) in &unlinks {
                     if cancel.is_cancelled() {
                         break;
                     }
@@ -826,7 +848,7 @@ where
                         synced_dirs.insert(parent.to_path_buf(), res);
                     }
                 }
-                for (src, final_dst, is_photo) in unlinks {
+                for (src, final_dst, is_photo, nbytes) in unlinks {
                     if cancel.is_cancelled() {
                         break;
                     }
@@ -865,6 +887,7 @@ where
                         ));
                     } else {
                         files_moved.fetch_add(1, Ordering::Relaxed);
+                        bytes_moved.fetch_add(nbytes, Ordering::Relaxed);
                     }
                 }
             }
@@ -872,10 +895,13 @@ where
     }
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    let total_bd = bytes_done.load(Ordering::Relaxed);
+    let total_bd = bytes_moved.load(Ordering::Relaxed);
+    let final_moved = files_moved.load(Ordering::Relaxed);
+    let final_skipped = files_skipped.load(Ordering::Relaxed);
+    let final_failed = files_failed.load(Ordering::Relaxed);
     on_progress(TransferProgress {
         files_total,
-        files_done: files_done.load(Ordering::Relaxed),
+        files_done: final_moved + final_skipped + final_failed,
         bytes_total,
         bytes_done: total_bd,
         speed_bps: if elapsed_ms > 0 {
