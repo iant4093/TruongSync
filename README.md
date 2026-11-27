@@ -192,7 +192,7 @@ The updater signing key is stored as the `TAURI_SIGNING_PRIVATE_KEY` repository 
 │                           guards, Menu Bar / System Tray, updater & bundle config
 ├── tests/                  Vitest unit and component tests
 ├── scripts/                Sidecar bundler (fetch-sidecars.mjs) & release script (release.mjs)
-├── docs/                   Screenshots and architecture documentation
+├── docs/                   Screenshots
 ├── public/                 App icon (app-icon.png)
 ├── .github/                CI/release workflow and Dependabot
 ├── index.html              Main desktop window entry
