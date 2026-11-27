@@ -199,7 +199,8 @@ pub struct AppState {
     pub paths: StoragePaths,
     pub initial_import_volume: Mutex<Option<String>>,
     bootstrapped: AtomicBool,
-    quiescing: Arc<AtomicBool>,
+    shutting_down: AtomicBool,
+    update_quiescing: Arc<AtomicBool>,
     import_running: Arc<AtomicBool>,
     geotag_running: Arc<AtomicBool>,
     update_running: Arc<AtomicBool>,
@@ -217,7 +218,8 @@ impl AppState {
             paths,
             initial_import_volume: Mutex::new(initial_import_volume),
             bootstrapped: AtomicBool::new(false),
-            quiescing: Arc::new(AtomicBool::new(false)),
+            shutting_down: AtomicBool::new(false),
+            update_quiescing: Arc::new(AtomicBool::new(false)),
             import_running: Arc::new(AtomicBool::new(false)),
             geotag_running: Arc::new(AtomicBool::new(false)),
             update_running: Arc::new(AtomicBool::new(false)),
@@ -230,20 +232,22 @@ impl AppState {
     }
 
     pub fn is_quiescing(&self) -> bool {
-        self.quiescing.load(Ordering::SeqCst)
+        self.shutting_down.load(Ordering::SeqCst) || self.update_quiescing.load(Ordering::SeqCst)
     }
 
     /// Permanently marks the app as shutting down so no new background jobs/follow-ups start.
+    /// Monotonic: cannot be cleared by `enter_quiesce_guard()` dropping on an update error.
     pub fn begin_shutdown(&self) {
-        self.quiescing.store(true, Ordering::SeqCst);
+        self.shutting_down.store(true, Ordering::SeqCst);
     }
 
     /// Temporarily quiesces new job/follow-up launches (e.g., while swapping the app bundle
-    /// during an in-app update), automatically clearing on Drop if installation fails.
+    /// during an in-app update), automatically clearing only the update quiesce flag on Drop
+    /// if installation fails (never undoing a permanent `begin_shutdown()`).
     pub fn enter_quiesce_guard(&self) -> FlagLockGuard {
-        self.quiescing.store(true, Ordering::SeqCst);
+        self.update_quiescing.store(true, Ordering::SeqCst);
         FlagLockGuard {
-            flag: Arc::clone(&self.quiescing),
+            flag: Arc::clone(&self.update_quiescing),
         }
     }
 
@@ -353,19 +357,24 @@ impl AppState {
         }
     }
 
-    pub fn register_cancel(&self, prefix: &str) -> CancelRegistration {
+    /// Atomically checks `is_quiescing()` while holding `active_cancels` so a concurrent
+    /// `begin_shutdown()` / `enter_quiesce_guard()` + `cancel_all_and_wait()` can never miss
+    /// a newly registering job. Returns `None` if the app is updating or shutting down.
+    pub fn try_register_cancel(&self, prefix: &str) -> Option<CancelRegistration> {
+        let mut guard = self.active_cancels.lock();
+        if self.is_quiescing() {
+            return None;
+        }
         let seq = CANCEL_SEQ.fetch_add(1, Ordering::Relaxed);
         let id = format!("{prefix}#{seq}");
         let token = CancellationToken::new();
-        if self.is_quiescing() {
-            token.cancel();
-        }
-        self.active_cancels.lock().insert(id.clone(), token.clone());
-        CancelRegistration {
+        guard.insert(id.clone(), token.clone());
+        drop(guard);
+        Some(CancelRegistration {
             map: Arc::clone(&self.active_cancels),
             id,
             token,
-        }
+        })
     }
 
     pub fn register_cancel_exact(
@@ -373,12 +382,12 @@ impl AppState {
         job_id: String,
         token: CancellationToken,
     ) -> CancelRegistration {
+        let mut guard = self.active_cancels.lock();
         if self.is_quiescing() {
             token.cancel();
         }
-        self.active_cancels
-            .lock()
-            .insert(job_id.clone(), token.clone());
+        guard.insert(job_id.clone(), token.clone());
+        drop(guard);
         CancelRegistration {
             map: Arc::clone(&self.active_cancels),
             id: job_id,
@@ -495,11 +504,13 @@ async fn run_locked_cloud_sync_background_inner(
     let Some(state) = app.try_state::<AppState>() else {
         return (false, false);
     };
+    let Some(cancel_reg) = state.try_register_cancel(&format!("bg-cloud:{profile_id}")) else {
+        return (false, true);
+    };
     let followup = FollowupSpec::from_sync(do_sync, restore_mode);
     let Some(lock_guard) = state.try_lock_cloud(profile_id, Some(app.clone()), followup) else {
         return (false, false);
     };
-    let cancel_reg = state.register_cancel(&format!("bg-cloud:{profile_id}"));
     let cancel = cancel_reg.token.clone();
     let db = state.db.clone();
     let paths = state.paths.clone();
@@ -657,11 +668,13 @@ async fn run_locked_external_sync_background_inner(
     let Some(state) = app.try_state::<AppState>() else {
         return (false, false);
     };
+    let Some(cancel_reg) = state.try_register_cancel(&format!("bg-ext:{profile_id}")) else {
+        return (false, true);
+    };
     let followup = FollowupSpec::from_sync(do_sync, restore_mode);
     let Some(lock_guard) = state.try_lock_external(profile_id, Some(app.clone()), followup) else {
         return (false, false);
     };
-    let cancel_reg = state.register_cancel(&format!("bg-ext:{profile_id}"));
     let cancel = cancel_reg.token.clone();
     let db = state.db.clone();
     let pid = profile_id.to_string();
@@ -1279,6 +1292,9 @@ pub async fn run_import_pipeline(
     state: State<'_, AppState>,
     req: ImportPipelineRequest,
 ) -> Result<PipelineSummary, String> {
+    let Some(cancel_reg) = state.try_register_cancel("import-pipeline") else {
+        return Err("TruongSync is updating or shutting down.".into());
+    };
     let Some(_import_guard) = state.try_lock_import() else {
         return Err("An SD card import pipeline is already running.".into());
     };
@@ -1295,7 +1311,6 @@ pub async fn run_import_pipeline(
 
     let db = state.db.clone();
     let paths = state.paths.clone();
-    let cancel_reg = state.register_cancel("import-pipeline");
     let cancel = cancel_reg.token.clone();
 
     let res = tokio::task::spawn_blocking(move || -> anyhow::Result<PipelineSummary> {
@@ -1895,6 +1910,9 @@ pub async fn run_geotag(
     items: Vec<PhotoGpsMatch>,
     record_backfill_updates: bool,
 ) -> Result<GeotagExecutionResult, String> {
+    let Some(cancel_reg) = state.try_register_cancel("geotag") else {
+        return Err("TruongSync is updating or shutting down.".into());
+    };
     let Some(_geotag_guard) = state.try_lock_geotag() else {
         return Err("An EXIF GPS geotag batch is already running.".into());
     };
@@ -1923,7 +1941,6 @@ pub async fn run_geotag(
         lock_overlapping_profiles(&state, &app, &unique_dirs, "write GPS EXIF")?;
 
     let db = state.db.clone();
-    let cancel_reg = state.register_cancel("geotag");
     let cancel = cancel_reg.token.clone();
 
     let res = tokio::task::spawn_blocking(move || -> anyhow::Result<GeotagExecutionResult> {
@@ -2116,9 +2133,11 @@ pub async fn connect_google_drive(
     client_id: Option<String>,
     client_secret: Option<String>,
 ) -> Result<Vec<String>, String> {
+    let Some(cancel_reg) = state.try_register_cancel("oauth") else {
+        return Err("TruongSync is updating or shutting down.".into());
+    };
     let settings = state.db.load_settings().map_err(map_err)?;
     let conf = state.paths.rclone_config_path.clone();
-    let cancel_reg = state.register_cancel("oauth");
     let cancel = cancel_reg.token.clone();
     tokio::task::spawn_blocking(move || {
         connect_google_drive_oauth(
@@ -2142,6 +2161,9 @@ pub async fn verify_cloud_cmd(
     profile_id: String,
     deep_md5: bool,
 ) -> Result<CloudVerifyReport, String> {
+    let Some(cancel_reg) = state.try_register_cancel(&format!("verify-cloud:{profile_id}")) else {
+        return Err("TruongSync is updating or shutting down.".into());
+    };
     // Acquire lock WITH app handle so any sync queued during Verify runs automatically on drop,
     // UNLESS the user cancels (or app exits/updates).
     let Some(lock_guard) = state.try_lock_cloud(&profile_id, Some(app.clone()), None) else {
@@ -2161,7 +2183,6 @@ pub async fn verify_cloud_cmd(
     }
     let db = state.db.clone();
     let conf = state.paths.rclone_config_path.clone();
-    let cancel_reg = state.register_cancel(&format!("verify-cloud:{profile_id}"));
     let cancel = cancel_reg.token.clone();
 
     let res = tokio::task::spawn_blocking(move || {
@@ -2192,6 +2213,9 @@ pub async fn sync_cloud_cmd(
     profile_id: String,
     restore_mode: bool,
 ) -> Result<CloudSyncResult, String> {
+    let Some(cancel_reg) = state.try_register_cancel(&format!("cloud:{profile_id}")) else {
+        return Err("TruongSync is updating or shutting down.".into());
+    };
     let Some(lock_guard) = state.try_lock_cloud(
         &profile_id,
         Some(app.clone()),
@@ -2217,7 +2241,6 @@ pub async fn sync_cloud_cmd(
     }
     let db = state.db.clone();
     let conf = state.paths.rclone_config_path.clone();
-    let cancel_reg = state.register_cancel(&format!("cloud:{profile_id}"));
     let cancel = cancel_reg.token.clone();
 
     let res = tokio::task::spawn_blocking(move || -> anyhow::Result<CloudSyncResult> {
@@ -2387,6 +2410,9 @@ pub async fn verify_external_cmd(
     profile_id: String,
     deep_md5: bool,
 ) -> Result<ExternalVerifyReport, String> {
+    let Some(cancel_reg) = state.try_register_cancel(&format!("verify-ext:{profile_id}")) else {
+        return Err("TruongSync is updating or shutting down.".into());
+    };
     let Some(lock_guard) = state.try_lock_external(&profile_id, Some(app.clone()), None) else {
         return Err("An external drive sync or verify is already running for this profile.".into());
     };
@@ -2402,7 +2428,6 @@ pub async fn verify_external_cmd(
         );
     }
     let db = state.db.clone();
-    let cancel_reg = state.register_cancel(&format!("verify-ext:{profile_id}"));
     let cancel = cancel_reg.token.clone();
     let res = tokio::task::spawn_blocking(move || {
         verify_external_profile_cancellable(&profile, &db, deep_md5, &cancel)
@@ -2424,6 +2449,9 @@ pub async fn sync_external_cmd(
     profile_id: String,
     restore_mode: bool,
 ) -> Result<ExternalSyncResult, String> {
+    let Some(cancel_reg) = state.try_register_cancel(&format!("ext:{profile_id}")) else {
+        return Err("TruongSync is updating or shutting down.".into());
+    };
     let Some(lock_guard) = state.try_lock_external(
         &profile_id,
         Some(app.clone()),
@@ -2448,7 +2476,6 @@ pub async fn sync_external_cmd(
         );
     }
     let db = state.db.clone();
-    let cancel_reg = state.register_cancel(&format!("ext:{profile_id}"));
     let cancel = cancel_reg.token.clone();
 
     let res = tokio::task::spawn_blocking(move || -> anyhow::Result<ExternalSyncResult> {

@@ -212,6 +212,9 @@ fn run_rclone_cancellable_with_timeout(
     cancel: &CancellationToken,
     timeout: Option<Duration>,
 ) -> Result<CmdOutput> {
+    if cancel.is_cancelled() {
+        return Err(anyhow!("Sync cancelled."));
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

@@ -193,17 +193,32 @@ pub fn start_volume_watcher(app: AppHandle) {
 
 /// Triggers sync across all enabled cloud profiles (used by the system tray menu).
 pub async fn trigger_all_enabled_cloud_syncs(app: AppHandle) {
+    if app
+        .try_state::<AppState>()
+        .is_some_and(|st| st.is_quiescing())
+    {
+        return;
+    }
     let app_snap = app.clone();
     let profiles = tokio::task::spawn_blocking(move || {
         let Some(state) = app_snap.try_state::<AppState>() else {
             return Vec::new();
         };
+        if state.is_quiescing() {
+            return Vec::new();
+        }
         state.db.list_cloud_profiles().unwrap_or_default()
     })
     .await
     .unwrap_or_default();
 
     for p in profiles.into_iter().filter(|p| p.enabled) {
+        if app
+            .try_state::<AppState>()
+            .is_some_and(|st| st.is_quiescing())
+        {
+            break;
+        }
         let app_c = app.clone();
         let pid = p.id.clone();
         tauri::async_runtime::spawn(async move {
@@ -374,6 +389,13 @@ pub fn start_background_scheduler(app: AppHandle) {
                         let mounted_vols = tokio::task::spawn_blocking(list_mounted_volumes)
                             .await
                             .unwrap_or_default();
+
+                        if app
+                            .try_state::<AppState>()
+                            .is_some_and(|st| st.is_quiescing())
+                        {
+                            continue;
+                        }
 
                         for (p, key, was_deferred, due) in ext_candidates {
                             let connected = mounted_vols

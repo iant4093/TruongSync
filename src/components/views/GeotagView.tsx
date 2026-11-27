@@ -158,7 +158,7 @@ export const GeotagView: React.FC = () => {
   };
 
   const handleWrite = async () => {
-    if (!plan || plan.matched_count === 0) return;
+    if (loading || writing || !plan || plan.matched_count === 0) return;
     if (isPlanStale) {
       notifyError('Geotag settings changed since the last preview. Run Match & Preview again before writing.');
       return;
@@ -169,6 +169,8 @@ export const GeotagView: React.FC = () => {
       `Applies to RAW and JPEG photos only (${plan.skipped_video_count} videos and ${plan.out_of_range_count} out-of-range photos will not be touched).`,
     );
     if (!ok) return;
+    previewSeqRef.current += 1;
+    setLoading(false);
     setWriting(true);
     try {
       const res = await api.runGeotag(plan.items, recordBackfill);
@@ -469,6 +471,7 @@ export const GeotagView: React.FC = () => {
               type="button"
               className="button button-primary"
               disabled={
+                loading ||
                 writing ||
                 isPlanStale ||
                 !maxGapValid ||

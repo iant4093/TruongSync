@@ -192,6 +192,9 @@ pub fn verify_external_profile_cancellable(
     deep_md5: bool,
     cancel: &CancellationToken,
 ) -> Result<ExternalVerifyReport> {
+    if cancel.is_cancelled() {
+        return Err(anyhow!("Sync cancelled."));
+    }
     let Some((vol, ext_root)) = resolve_external_target(profile) else {
         return Ok(ExternalVerifyReport {
             profile_id: profile.id.clone(),
@@ -1176,6 +1179,9 @@ pub fn sync_external_profile<F>(
 where
     F: Fn(&str, usize, usize, u64) + Send + Sync,
 {
+    if cancel.is_cancelled() {
+        return Err(anyhow!("Sync cancelled."));
+    }
     let Some((vol, ext_root)) = resolve_external_target(profile) else {
         return Err(anyhow!(
             "External drive '{}' is not connected. Plug it in and try again.",
