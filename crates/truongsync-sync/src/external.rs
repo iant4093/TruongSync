@@ -279,16 +279,40 @@ fn verify_external_roots_inner(
     cancel: &CancellationToken,
 ) -> Result<ExternalVerifyContext> {
     let ext_root_exists = ext_root.exists();
+    let scan_cancel = cancel.child_token();
     let (local_res, ext_res) = std::thread::scope(|s| {
-        let local_handle = s.spawn(|| scan_dir(local_root, !restore_mode, false, cancel));
-        let ext_res = scan_dir(ext_root, false, true, cancel);
+        let sc_local = scan_cancel.clone();
+        let local_handle = s.spawn(move || {
+            let r = scan_dir(local_root, !restore_mode, false, &sc_local);
+            if r.is_err() {
+                sc_local.cancel();
+            }
+            r
+        });
+        let ext_res = scan_dir(ext_root, false, true, &scan_cancel);
+        if ext_res.is_err() {
+            scan_cancel.cancel();
+        }
         let local_res = local_handle
             .join()
             .unwrap_or_else(|_| Err(anyhow!("local scan thread panicked")));
         (local_res, ext_res)
     });
-    let (local_map, local_exact_dups, local_mac) = local_res?;
-    let (ext_map, ext_exact_dups, ext_mac) = ext_res?;
+    if cancel.is_cancelled() {
+        return Err(anyhow!("Sync cancelled."));
+    }
+    let ((local_map, local_exact_dups, local_mac), (ext_map, ext_exact_dups, ext_mac)) =
+        match (local_res, ext_res) {
+            (Ok(l), Ok(e)) => (l, e),
+            (Err(le), Err(ee)) => {
+                if le.to_string() == "Sync cancelled." {
+                    return Err(ee);
+                }
+                return Err(le);
+            }
+            (Err(le), _) => return Err(le),
+            (_, Err(ee)) => return Err(ee),
+        };
     // Immediately verify the external mount identity survived the directory walk so a
     // mid-scan disconnect never misclassifies the entire library as "missing on external".
     check_mount_device_identity(mount_guard)?;
@@ -402,6 +426,9 @@ fn verify_external_roots_inner(
             targets
                 .into_iter()
                 .map(|p| {
+                    if cancel.is_cancelled() {
+                        return (p, Err("Sync cancelled.".to_string()));
+                    }
                     let res = compute_file_md5_with_buf(&p, &mut buf).map_err(|e| e.to_string());
                     (p, res)
                 })
@@ -409,11 +436,18 @@ fn verify_external_roots_inner(
         }
     } else if md5_targets.len() == 1 {
         let p = md5_targets.into_iter().next().unwrap().to_path_buf();
-        let res = compute_file_md5(&p).map_err(|e| e.to_string());
+        let res = if cancel.is_cancelled() {
+            Err("Sync cancelled.".to_string())
+        } else {
+            compute_file_md5(&p).map_err(|e| e.to_string())
+        };
         HashMap::from([(p, res)])
     } else {
         HashMap::new()
     };
+    if cancel.is_cancelled() {
+        return Err(anyhow!("Sync cancelled."));
+    }
     if !precomputed_md5s.is_empty() {
         check_mount_device_identity(mount_guard)?;
     }
@@ -1251,6 +1285,10 @@ where
     )?;
     let report = ctx.report;
 
+    if cancel.is_cancelled() {
+        return Err(anyhow!("Sync cancelled."));
+    }
+
     let pulls: Vec<String> = report.to_pull.iter().map(|i| i.rel_path.clone()).collect();
     let pushes: Vec<String> = if restore_mode {
         Vec::new()
@@ -1306,38 +1344,31 @@ where
     }
 
     if !pushes.is_empty() || !backfills.is_empty() {
+        if cancel.is_cancelled() {
+            return Err(anyhow!("Sync cancelled."));
+        }
         check_mount_device_identity(mount_guard)?;
         std::fs::create_dir_all(ext_root)?;
     }
 
-    // Pre-validate symlink safety and pre-create every unique destination parent directory once
-    // before entering the parallel copy loops (eliminates redundant per-file stat walks).
-    let mut validated_local_parents: HashSet<PathBuf> = HashSet::new();
-    for rel in &pulls {
-        let dst = join_rel_path(local_root, rel);
-        let parent = dst.parent().unwrap_or(local_root).to_path_buf();
-        if !validated_local_parents.contains(&parent)
-            && crate::cloud::ensure_no_symlink_ancestors(local_root, &parent).is_ok()
-            && std::fs::create_dir_all(&parent).is_ok()
-        {
-            validated_local_parents.insert(parent);
+    // Lazily validate symlink safety and create destination parent directories at most once
+    // per unique parent ONLY when a file in that directory is actively about to be copied
+    // (avoiding orphaned empty directory trees on early cancel or drive disconnect).
+    let validated_local_parents: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
+    let validated_ext_parents: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
+    let ensure_parent_cached = |root: &Path, dst: &Path, cache: &Mutex<HashSet<PathBuf>>| -> bool {
+        let parent = dst.parent().unwrap_or(root);
+        if cache.lock().contains(parent) {
+            return true;
         }
-    }
-    let mut validated_ext_parents: HashSet<PathBuf> = HashSet::new();
-    for rel in pushes.iter().chain(backfills.iter()) {
-        let dst = ctx
-            .ext_map
-            .get(rel)
-            .map(|e| e.abs_path.clone())
-            .unwrap_or_else(|| join_rel_path(ext_root, rel));
-        let parent = dst.parent().unwrap_or(ext_root).to_path_buf();
-        if !validated_ext_parents.contains(&parent)
-            && crate::cloud::ensure_no_symlink_ancestors(ext_root, &parent).is_ok()
-            && std::fs::create_dir_all(&parent).is_ok()
+        if crate::cloud::ensure_no_symlink_ancestors(root, parent).is_ok()
+            && std::fs::create_dir_all(parent).is_ok()
         {
-            validated_ext_parents.insert(parent);
+            cache.lock().insert(parent.to_path_buf());
+            return true;
         }
-    }
+        false
+    };
 
     let total_ops = pulls.len() + pushes.len() + backfills.len();
     let done = Arc::new(AtomicUsize::new(0));
@@ -1430,9 +1461,7 @@ where
                     .map(|e| e.abs_path.clone())
                     .unwrap_or_else(|| join_rel_path(ext_root, rel));
                 let dst = join_rel_path(local_root, rel);
-                let skip_parent = dst
-                    .parent()
-                    .is_some_and(|p| validated_local_parents.contains(p));
+                let skip_parent = ensure_parent_cached(local_root, &dst, &validated_local_parents);
                 match atomic_copy_preserve_mtime(
                     local_root,
                     &src,
@@ -1496,9 +1525,7 @@ where
                     .map(|l| l.abs_path.clone())
                     .unwrap_or_else(|| join_rel_path(local_root, rel));
                 let dst = join_rel_path(ext_root, rel);
-                let skip_parent = dst
-                    .parent()
-                    .is_some_and(|p| validated_ext_parents.contains(p));
+                let skip_parent = ensure_parent_cached(ext_root, &dst, &validated_ext_parents);
                 match atomic_copy_preserve_mtime(
                     ext_root,
                     &src,
@@ -1572,9 +1599,7 @@ where
                         .push((rel.clone(), "Missing intentional update metadata".into()));
                     return;
                 };
-                let skip_parent = dst
-                    .parent()
-                    .is_some_and(|p| validated_ext_parents.contains(p));
+                let skip_parent = ensure_parent_cached(ext_root, &dst, &validated_ext_parents);
                 // Stream-verify copied bytes == post_md5 AND re-verify dst == pre_set right before commit!
                 match atomic_copy_preserve_mtime(
                     ext_root,

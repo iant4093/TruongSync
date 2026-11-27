@@ -27,8 +27,14 @@ impl DbHandle {
             .with_context(|| format!("failed to open SQLite db at {}", path.display()))?;
         // Set busy_timeout BEFORE journal_mode=WAL so concurrent opens never fail immediately with SQLITE_BUSY.
         conn.pragma_update(None, "busy_timeout", 5000)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        let active_mode: String =
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+        let sync_mode = if active_mode.eq_ignore_ascii_case("wal") {
+            "NORMAL"
+        } else {
+            "FULL"
+        };
+        conn.pragma_update(None, "synchronous", sync_mode)?;
         conn.pragma_update(None, "cache_size", -16000)?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         let _ = conn.pragma_update(None, "mmap_size", 67_108_864i64);

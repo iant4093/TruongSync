@@ -13,6 +13,7 @@ export const SettingsView: React.FC = () => {
   const settings = useSyncStore((s) => s.settings);
   const bootstrap = useSyncStore((s) => s.bootstrap);
   const tools = useSyncStore((s) => s.tools);
+  const toolsReady = useSyncStore((s) => s.toolsChecked || s.tools !== null);
   const refreshSettings = useSyncStore((s) => s.refreshSettings);
   const refreshTools = useSyncStore((s) => s.refreshTools);
   const refreshProfiles = useSyncStore((s) => s.refreshProfiles);
@@ -422,10 +423,12 @@ export const SettingsView: React.FC = () => {
             <div className="settings-field" style={{ marginBottom: 0 }}>
               <span className="row-between">
                 <span>ExifTool Path Override</span>
-                <Badge tone={tools?.exiftool.available ? 'ok' : 'danger'}>
-                  {tools?.exiftool.available
-                    ? `${tools.exiftool.bundled ? 'Bundled · ' : ''}v${tools.exiftool.version}`
-                    : 'Missing'}
+                <Badge tone={!toolsReady ? 'muted' : tools?.exiftool.available ? 'ok' : 'danger'}>
+                  {!toolsReady
+                    ? 'Checking…'
+                    : tools?.exiftool.available
+                      ? `${tools.exiftool.bundled ? 'Bundled · ' : ''}v${tools.exiftool.version}`
+                      : 'Missing'}
                 </Badge>
               </span>
               <input
@@ -441,12 +444,14 @@ export const SettingsView: React.FC = () => {
             <div className="settings-field" style={{ marginBottom: 0 }}>
               <span className="row-between">
                 <span>rclone Path Override</span>
-                <Badge tone={tools?.rclone.available ? 'ok' : 'danger'}>
-                  {tools?.rclone.available
-                    ? tools.rclone.bundled
-                      ? 'Bundled'
-                      : 'Found'
-                    : 'Missing'}
+                <Badge tone={!toolsReady ? 'muted' : tools?.rclone.available ? 'ok' : 'danger'}>
+                  {!toolsReady
+                    ? 'Checking…'
+                    : tools?.rclone.available
+                      ? tools.rclone.bundled
+                        ? 'Bundled'
+                        : 'Found'
+                      : 'Missing'}
                 </Badge>
               </span>
               <input

@@ -14,6 +14,7 @@ export const QuickSetupCard: React.FC<{
 }> = ({ onRootPicked }) => {
   const settings = useSyncStore((s) => s.settings);
   const tools = useSyncStore((s) => s.tools);
+  const toolsChecked = useSyncStore((s) => s.toolsChecked);
   const cloudProfiles = useSyncStore((s) => s.cloudProfiles);
   const externalProfiles = useSyncStore((s) => s.externalProfiles);
   const setActiveNav = useSyncStore((s) => s.setActiveNav);
@@ -24,7 +25,9 @@ export const QuickSetupCard: React.FC<{
     () => typeof localStorage !== 'undefined' && localStorage.getItem('ts_hide_quick_setup') === '1',
   );
 
-  if (dismissed || !settings) return null;
+  // Wait until the initial tool probe settles before deciding whether to show Quick Setup,
+  // avoiding a layout-shift flash on cold launch for already-configured users.
+  if (dismissed || !settings || (!toolsChecked && !tools)) return null;
 
   const hasLibraryRoot = Boolean(settings.default_import_root.trim());
   const hasCloud = Boolean(tools?.rclone_config_exists && cloudProfiles.length > 0);

@@ -595,7 +595,7 @@ async fn run_locked_cloud_sync_background_inner(
     .unwrap_or(false);
 
     let cancelled = cancel_reg.token.is_cancelled();
-    if ok || cancelled {
+    if (!restore_mode && ok) || cancelled {
         state.deferred_on_connect.lock().remove(profile_id);
     }
     if cancelled {
@@ -762,7 +762,7 @@ async fn run_locked_external_sync_background_inner(
     .unwrap_or(false);
 
     let cancelled = cancel_reg.token.is_cancelled();
-    if ok || cancelled {
+    if (!restore_mode && ok) || cancelled {
         state.deferred_on_connect.lock().remove(profile_id);
     }
     if cancelled {
@@ -1255,12 +1255,12 @@ pub async fn run_import_pipeline(
             "Cannot start an SD card import while an EXIF GPS geotag batch is running.".into(),
         );
     }
+    let settings = state.db.load_settings().map_err(map_err)?;
     let dest_target = PathBuf::from(req.dest_root.trim());
     let _write_roots_guard = state.register_write_roots(std::slice::from_ref(&dest_target));
     let (mut held_cloud_locks, mut held_ext_locks) =
         lock_overlapping_profiles(&state, &app, &[dest_target], "start SD card import")?;
 
-    let settings = state.db.load_settings().map_err(map_err)?;
     let db = state.db.clone();
     let paths = state.paths.clone();
     let cancel_reg = state.register_cancel("import-pipeline");
@@ -1885,16 +1885,17 @@ pub async fn run_geotag(
         }
         set.into_iter().collect()
     };
+    let settings = state.db.load_settings().map_err(map_err)?;
     let _write_roots_guard = state.register_write_roots(&unique_dirs);
     let (held_cloud_locks, held_ext_locks) =
         lock_overlapping_profiles(&state, &app, &unique_dirs, "write GPS EXIF")?;
 
-    let settings = state.db.load_settings().map_err(map_err)?;
     let db = state.db.clone();
     let cancel_reg = state.register_cancel("geotag");
     let cancel = cancel_reg.token.clone();
 
     let res = tokio::task::spawn_blocking(move || -> anyhow::Result<GeotagExecutionResult> {
+        let _write_roots_guard = _write_roots_guard;
         let _guard = SleepGuard::acquire(settings.prevent_sleep_during_transfers);
         let job_id = db.create_job("geotag", "EXIF GPS Geotag", items.len() as i64, 0)?;
         let _exact_cancel = app
@@ -1992,9 +1993,8 @@ pub async fn run_geotag(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Release active write-roots BEFORE dropping overlapping profile locks so any queued
-    // follow-up sync spawned on `ProfileLockGuard::drop` never races a still-registered root.
-    drop(_write_roots_guard);
+    // `_write_roots_guard` was already dropped inside `spawn_blocking` before awaiting, so
+    // any queued follow-up sync spawned when `held_*_locks` drop never races a live write root.
     if cancel_reg.token.is_cancelled() {
         for g in held_cloud_locks.values() {
             g.suppress_followup_on_cancel();
@@ -2522,7 +2522,9 @@ pub async fn sync_external_cmd(
     .await
     .map_err(|e| e.to_string())?;
 
-    if res.is_ok() || cancel_reg.token.is_cancelled() {
+    if (!restore_mode && res.as_ref().is_ok_and(|s| s.failed_count == 0))
+        || cancel_reg.token.is_cancelled()
+    {
         state.deferred_on_connect.lock().remove(&profile_id);
     }
     if cancel_reg.token.is_cancelled() {

@@ -813,16 +813,42 @@ fn verify_cloud_inner(
         ));
     }
     let remote = remote_spec(profile)?;
+    let scan_cancel = cancel.child_token();
     let (local_res, remote_res) = std::thread::scope(|s| {
-        let local_handle = s.spawn(|| scan_local_tree(local_root, !restore_mode, cancel));
-        let remote_res = list_remote_tree(&bin, managed_conf, &remote, cancel);
+        let sc_local = scan_cancel.clone();
+        let local_handle = s.spawn(move || {
+            let r = scan_local_tree(local_root, !restore_mode, &sc_local);
+            if r.is_err() {
+                sc_local.cancel();
+            }
+            r
+        });
+        let remote_res = list_remote_tree(&bin, managed_conf, &remote, &scan_cancel);
+        if remote_res.is_err() {
+            scan_cancel.cancel();
+        }
         let local_res = local_handle
             .join()
             .unwrap_or_else(|_| Err(anyhow!("local scan thread panicked")));
         (local_res, remote_res)
     });
-    let (local_map, local_exact_dups, local_mac) = local_res?;
-    let (remote_map, duplicate_remote_paths, remote_mac, remote_root_exists) = remote_res?;
+    if cancel.is_cancelled() {
+        return Err(anyhow!("Sync cancelled."));
+    }
+    let (
+        (local_map, local_exact_dups, local_mac),
+        (remote_map, duplicate_remote_paths, remote_mac, remote_root_exists),
+    ) = match (local_res, remote_res) {
+        (Ok(l), Ok(r)) => (l, r),
+        (Err(le), Err(re)) => {
+            if le.to_string() == "Sync cancelled." {
+                return Err(re);
+            }
+            return Err(le);
+        }
+        (Err(le), _) => return Err(le),
+        (_, Err(re)) => return Err(re),
+    };
 
     let manifest = db.load_manifest_map("cloud", &profile.id)?;
     let pending_updates = db.list_pending_intentional_updates_for_target("cloud", &profile.id)?;
@@ -923,6 +949,9 @@ fn verify_cloud_inner(
             targets
                 .into_iter()
                 .map(|p| {
+                    if cancel.is_cancelled() {
+                        return (p, Err("Sync cancelled.".to_string()));
+                    }
                     let res = compute_file_md5_with_buf(&p, &mut buf).map_err(|e| e.to_string());
                     (p, res)
                 })
@@ -930,11 +959,18 @@ fn verify_cloud_inner(
         }
     } else if md5_targets.len() == 1 {
         let p = md5_targets.into_iter().next().unwrap().to_path_buf();
-        let res = compute_file_md5(&p).map_err(|e| e.to_string());
+        let res = if cancel.is_cancelled() {
+            Err("Sync cancelled.".to_string())
+        } else {
+            compute_file_md5(&p).map_err(|e| e.to_string())
+        };
         HashMap::from([(p, res)])
     } else {
         HashMap::new()
     };
+    if cancel.is_cancelled() {
+        return Err(anyhow!("Sync cancelled."));
+    }
     let lookup_local_md5 = |p: &Path| -> Result<String, String> {
         if let Some(res) = precomputed_md5s.get(p) {
             return res.clone();
@@ -1384,59 +1420,73 @@ where
     }
 
     let remote = remote_spec(profile)?;
-    let bwlimit = settings
+    let bwlimit_mbps = settings
         .bandwidth_limit_mbps
-        .filter(|&v| v.is_finite() && v > 0.0)
-        .map(|v| format!("{v:.2}M"));
+        .filter(|&v| v.is_finite() && v > 0.0);
+    let bwlimit = bwlimit_mbps.map(|v| format!("{}K", ((v * 1024.0).round() as u64).max(1)));
 
     let mut notes = Vec::new();
     let mut backfill_replaced = 0usize;
     let mut backfill_failed = 0usize;
 
     // Step 0: Safe GPS backfill replacements (re-verifies local MD5 == post_md5 & live remote MD5 right before copyto!)
-    // Parallelized up to 4 concurrent uploads when multiple geotagged photos are queued.
+    // Parallelized up to 4 concurrent uploads when multiple geotagged photos are queued,
+    // dividing any configured bandwidth cap evenly across concurrent rclone processes.
     if !restore_mode && !report.backfill_updates.is_empty() {
         let total_bf = report.backfill_updates.len();
         let bf_done = AtomicUsize::new(0);
         let bf_ok = AtomicUsize::new(0);
         let bf_fail = AtomicUsize::new(0);
         let bf_notes: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        let bf_last_emit = Mutex::new(Instant::now() - Duration::from_secs(1));
+        let bf_progress_gate: Mutex<(Instant, usize)> =
+            Mutex::new((Instant::now() - Duration::from_secs(1), 0));
         let bf_threads = total_bf.clamp(1, 4);
+        let bf_bwlimit = bwlimit_mbps.map(|v| {
+            format!(
+                "{}K",
+                ((v * 1024.0 / bf_threads as f64).round() as u64).max(1)
+            )
+        });
 
-        let run_one_backfill = |item: &SyncDiffItem, md5_buf: &mut [u8]| {
-            if cancel.is_cancelled() {
-                return;
-            }
+        on_progress(
+            &format!("Updating geotagged photos on Drive (0/{total_bf})…"),
+            0,
+            total_bf,
+        );
+
+        let report_bf_done = || {
             let done_now = bf_done.fetch_add(1, Ordering::Relaxed) + 1;
-            let should_emit = if done_now == total_bf {
-                true
-            } else {
-                let mut g = bf_last_emit.lock();
-                if g.elapsed() >= Duration::from_millis(80) {
-                    *g = Instant::now();
-                    true
-                } else {
-                    false
-                }
-            };
-            if should_emit {
+            let mut gate = bf_progress_gate.lock();
+            if done_now > gate.1
+                && (done_now >= total_bf || gate.0.elapsed() >= Duration::from_millis(80))
+            {
+                gate.0 = Instant::now();
+                gate.1 = done_now;
                 on_progress(
                     &format!("Updating geotagged photo on Drive ({done_now}/{total_bf})…"),
                     done_now,
                     total_bf,
                 );
             }
+        };
+
+        let run_one_backfill = |item: &SyncDiffItem, md5_buf: &mut [u8]| {
+            if cancel.is_cancelled() {
+                return;
+            }
             let Some(loc_meta) = ctx.local_map.get(&item.rel_path) else {
                 bf_fail.fetch_add(1, Ordering::Relaxed);
+                report_bf_done();
                 return;
             };
             let Some(rem_meta) = ctx.remote_map.get(&item.rel_path) else {
                 bf_fail.fetch_add(1, Ordering::Relaxed);
+                report_bf_done();
                 return;
             };
             let Some((ids, pre_set, post_md5)) = ctx.intentional_by_rel.get(&item.rel_path) else {
                 bf_fail.fetch_add(1, Ordering::Relaxed);
+                report_bf_done();
                 return;
             };
             // Re-verify local file still matches expected post_md5 (local TOCTOU guard)
@@ -1448,6 +1498,7 @@ where
                         "Skipped GPS backfill for {}: local file changed after geotagging",
                         item.rel_path
                     ));
+                    report_bf_done();
                     return;
                 }
                 Err(e) => {
@@ -1456,6 +1507,7 @@ where
                         "Skipped GPS backfill for {}: failed to read local file ({e})",
                         item.rel_path
                     ));
+                    report_bf_done();
                     return;
                 }
             };
@@ -1470,6 +1522,7 @@ where
                         "Skipped GPS backfill for {}: remote Drive copy changed since scan",
                         item.rel_path
                     ));
+                    report_bf_done();
                     return;
                 }
                 Ok(None) => {
@@ -1478,6 +1531,7 @@ where
                         "Skipped GPS backfill for {}: could not re-verify remote Drive MD5",
                         item.rel_path
                     ));
+                    report_bf_done();
                     return;
                 }
                 Err(_) if cancel.is_cancelled() => return,
@@ -1487,6 +1541,7 @@ where
                         "Skipped GPS backfill for {}: failed checking remote MD5 ({e})",
                         item.rel_path
                     ));
+                    report_bf_done();
                     return;
                 }
             }
@@ -1503,7 +1558,7 @@ where
                 "--retries",
                 "5",
             ]);
-            if let Some(ref bw) = bwlimit {
+            if let Some(ref bw) = bf_bwlimit {
                 cmd.args(["--bwlimit", bw]);
             }
             cmd.arg("--").arg(&loc_meta.abs_path).arg(&remote_file);
@@ -1516,6 +1571,7 @@ where
                         "GPS backfill update failed for {}: {e}",
                         item.rel_path
                     ));
+                    report_bf_done();
                     return;
                 }
             };
@@ -1539,6 +1595,7 @@ where
                     String::from_utf8_lossy(&out.stderr).trim()
                 ));
             }
+            report_bf_done();
         };
 
         if bf_threads > 1 {

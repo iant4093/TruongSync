@@ -719,7 +719,7 @@ where
         if cancel.is_cancelled() {
             break;
         }
-        let pending_unlinks: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+        let pending_unlinks: Mutex<Vec<(PathBuf, PathBuf, bool)>> = Mutex::new(Vec::new());
         pool.install(|| {
             chunk.par_iter().for_each_init(
                 || vec![0u8; 2 * 1024 * 1024],
@@ -740,16 +740,22 @@ where
                     ) {
                         Ok(SingleOutcome::Transferred(final_dst, nbytes)) => {
                             shoot_roots_set.lock().insert(item.shoot_root.clone());
-                            files_moved.fetch_add(1, Ordering::Relaxed);
+                            let is_photo = matches!(item.kind, MediaKind::Raw | MediaKind::Jpeg);
                             let bd = bytes_done.fetch_add(nbytes, Ordering::Relaxed) + nbytes;
                             let fd = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-                            if matches!(item.kind, MediaKind::Raw | MediaKind::Jpeg) {
-                                dest_photos
-                                    .lock()
-                                    .push(final_dst.to_string_lossy().to_string());
-                            }
                             if is_move {
-                                pending_unlinks.lock().push((src.to_path_buf(), final_dst));
+                                pending_unlinks.lock().push((
+                                    src.to_path_buf(),
+                                    final_dst,
+                                    is_photo,
+                                ));
+                            } else {
+                                files_moved.fetch_add(1, Ordering::Relaxed);
+                                if is_photo {
+                                    dest_photos
+                                        .lock()
+                                        .push(final_dst.to_string_lossy().to_string());
+                                }
                             }
                             emit_throttled(
                                 &last_emit,
@@ -806,18 +812,24 @@ where
             );
         });
 
-        if is_move {
+        if is_move && !cancel.is_cancelled() {
             let unlinks = pending_unlinks.into_inner();
             if !unlinks.is_empty() {
                 let mut synced_dirs: HashMap<PathBuf, Result<(), String>> = HashMap::new();
-                for (_, final_dst) in &unlinks {
+                for (_, final_dst, _) in &unlinks {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
                     let parent = final_dst.parent().unwrap_or_else(|| Path::new("."));
                     if !synced_dirs.contains_key(parent) {
                         let res = sync_parent_dir(final_dst).map_err(|e| e.to_string());
                         synced_dirs.insert(parent.to_path_buf(), res);
                     }
                 }
-                for (src, final_dst) in unlinks {
+                for (src, final_dst, is_photo) in unlinks {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
                     let parent = final_dst.parent().unwrap_or_else(|| Path::new("."));
                     if let Some(Err(sync_err)) = synced_dirs.get(parent) {
                         files_failed.fetch_add(1, Ordering::Relaxed);
@@ -828,6 +840,11 @@ where
                             ),
                         ));
                         continue;
+                    }
+                    if is_photo {
+                        dest_photos
+                            .lock()
+                            .push(final_dst.to_string_lossy().to_string());
                     }
                     if is_same_file_path(&src, &final_dst) {
                         files_failed.fetch_add(1, Ordering::Relaxed);
@@ -846,6 +863,8 @@ where
                                 final_dst.display()
                             ),
                         ));
+                    } else {
+                        files_moved.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -1018,7 +1037,7 @@ fn normalize_reservation_key(p: &Path) -> String {
 fn reserve_unique_dest(desired: &Path, reserved: &Mutex<HashSet<String>>) -> Result<PathBuf> {
     let mut guard = reserved.lock();
     let desired_key = normalize_reservation_key(desired);
-    if !desired.exists() && !guard.contains(&desired_key) {
+    if desired.symlink_metadata().is_err() && !guard.contains(&desired_key) {
         guard.insert(desired_key);
         return Ok(desired.to_path_buf());
     }
@@ -1035,7 +1054,7 @@ fn reserve_unique_dest(desired: &Path, reserved: &Mutex<HashSet<String>>) -> Res
         };
         let cand = parent.join(name);
         let key = normalize_reservation_key(&cand);
-        if !cand.exists() && !guard.contains(&key) {
+        if cand.symlink_metadata().is_err() && !guard.contains(&key) {
             guard.insert(key);
             return Ok(cand);
         }

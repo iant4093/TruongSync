@@ -109,12 +109,20 @@ export const ActivityView: React.FC = () => {
             return (
               <div
                 key={j.id}
+                role="button"
+                tabIndex={0}
                 className="folder-row"
                 style={{
                   cursor: 'pointer',
                   background: inspectorJobId === j.id ? '#2b2b2b' : undefined,
                 }}
                 onClick={() => setInspectorJobId(j.id)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    setInspectorJobId(j.id);
+                  }
+                }}
               >
                 <div className="stack" style={{ gap: 3 }}>
                   <div className="row-wrap">
@@ -148,6 +156,11 @@ export const JobInspectorDrawer: React.FC = () => {
 
   const selectedJob =
     activeNav === 'activity' ? (jobs.find((j) => j.id === inspectorJobId) ?? null) : null;
+  const isOpen = Boolean(selectedJob);
+
+  useEffect(() => {
+    setItems([]);
+  }, [inspectorJobId]);
 
   useEffect(() => {
     if (!inspectorJobId) {
@@ -169,7 +182,7 @@ export const JobInspectorDrawer: React.FC = () => {
   }, [inspectorJobId, selectedJob?.status, selectedJob?.files_done, selectedJob?.files_failed]);
 
   useEffect(() => {
-    if (!selectedJob) return;
+    if (!isOpen) return;
     const layer = pushEscapeLayer();
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape' && isTopEscapeLayer(layer)) {
@@ -182,7 +195,7 @@ export const JobInspectorDrawer: React.FC = () => {
       document.removeEventListener('keydown', onKey, true);
       popEscapeLayer(layer);
     };
-  }, [selectedJob, setInspectorJobId]);
+  }, [isOpen, setInspectorJobId]);
 
   return (
     <div className="inspector-slot" aria-hidden={!selectedJob}>

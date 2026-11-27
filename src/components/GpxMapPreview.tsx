@@ -116,6 +116,7 @@ export const GpxMapPreview: React.FC<{ plan: GeotagPlan }> = ({ plan }) => {
   const planRef = useRef<GeotagPlan>(plan);
   const loadedRef = useRef(false);
   const fellBackRef = useRef(false);
+  const needsFitRef = useRef(false);
   const [offlineMode, setOfflineMode] = useState(false);
   const [webglError, setWebglError] = useState(false);
 
@@ -127,6 +128,7 @@ export const GpxMapPreview: React.FC<{ plan: GeotagPlan }> = ({ plan }) => {
 
     loadedRef.current = false;
     fellBackRef.current = false;
+    needsFitRef.current = false;
     setWebglError(false);
 
     let map: maplibregl.Map;
@@ -149,6 +151,7 @@ export const GpxMapPreview: React.FC<{ plan: GeotagPlan }> = ({ plan }) => {
       loadedRef.current = true;
       try {
         applyPlanToMap(map, planRef.current);
+        needsFitRef.current = el.offsetWidth === 0 || el.offsetHeight === 0;
       } catch {
         // Style might still be swapping
       }
@@ -160,6 +163,14 @@ export const GpxMapPreview: React.FC<{ plan: GeotagPlan }> = ({ plan }) => {
         ? new ResizeObserver(() => {
             if (el.offsetWidth > 0 && el.offsetHeight > 0) {
               map.resize();
+              if (needsFitRef.current && loadedRef.current) {
+                needsFitRef.current = false;
+                try {
+                  applyPlanToMap(map, planRef.current);
+                } catch {
+                  // ignore
+                }
+              }
             }
           })
         : null;
@@ -189,9 +200,11 @@ export const GpxMapPreview: React.FC<{ plan: GeotagPlan }> = ({ plan }) => {
 
   useEffect(() => {
     const map = mapRef.current;
+    const el = containerRef.current;
     if (!map || !loadedRef.current) return;
     try {
       applyPlanToMap(map, plan);
+      needsFitRef.current = Boolean(el && (el.offsetWidth === 0 || el.offsetHeight === 0));
     } catch {
       // Wait for style.load
     }

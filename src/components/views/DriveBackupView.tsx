@@ -62,12 +62,13 @@ export const DriveBackupView: React.FC = () => {
   const [reportSyncStamps, setReportSyncStamps] = useState<Record<string, string>>({});
 
   // Auto-invalidate stale verify reports when a background/pipeline/partial sync finishes
-  // or when the external drive disconnects (so reconnecting never resurrects a stale report).
+  // or when the external drive disconnects (skip while re-verify is in-flight to prevent flicker).
   useEffect(() => {
     setReports((prev) => {
       let changed = false;
       const next = { ...prev };
       for (const id of Object.keys(prev)) {
+        if (busyMap[id] === 'verify') continue;
         const p = externalProfiles.find((e) => e.id === id);
         const connected = p
           ? volumes.some((v) =>
@@ -83,11 +84,20 @@ export const DriveBackupView: React.FC = () => {
       }
       return changed ? next : prev;
     });
-  }, [externalProfiles, volumes, reportSyncStamps]);
+  }, [externalProfiles, volumes, reportSyncStamps, busyMap]);
 
   const openEditor = (profile: ExternalProfile) => {
     setEditing(profile);
     setStaleDaysText(String(profile.stale_after_days || 14));
+  };
+
+  const openNewProfile = () => {
+    const firstExt = volumes.find((v) => !v.has_dcim);
+    openEditor({
+      ...BLANK_EXTERNAL,
+      volume_uuid: firstExt?.volume_uuid ?? '',
+      volume_label: firstExt?.label ?? '',
+    });
   };
 
   const setProfileBusy = (id: string, kind: 'verify' | 'sync' | null) => {
@@ -162,13 +172,23 @@ export const DriveBackupView: React.FC = () => {
       const freshProfile = useSyncStore
         .getState()
         .externalProfiles.find((e) => e.id === profileId);
-      if (freshProfile) {
+      const superseded = Boolean(
+        freshProfile?.last_sync_at &&
+          Date.parse(freshProfile.last_sync_at) > Date.parse(rep.checked_at),
+      );
+      if (freshProfile && !superseded) {
         setReportSyncStamps((prev) => ({
           ...prev,
           [profileId]: externalVerifyStamp(freshProfile),
         }));
+        setReports((prev) => ({ ...prev, [profileId]: rep }));
+      } else if (superseded) {
+        setReports((prev) => {
+          const next = { ...prev };
+          delete next[profileId];
+          return next;
+        });
       }
-      setReports((prev) => ({ ...prev, [profileId]: rep }));
       if (!rep.volume_connected) {
         notifyError('External drive is not currently connected.');
       } else {
@@ -247,18 +267,7 @@ export const DriveBackupView: React.FC = () => {
             <button type="button" className="button" onClick={() => void refreshVolumes()}>
               <RefreshCw size={14} /> Refresh Drives
             </button>
-            <button
-              type="button"
-              className="button button-primary"
-              onClick={() => {
-                const firstExt = volumes.find((v) => !v.has_dcim);
-                openEditor({
-                  ...BLANK_EXTERNAL,
-                  volume_uuid: firstExt?.volume_uuid ?? '',
-                  volume_label: firstExt?.label ?? '',
-                });
-              }}
-            >
+            <button type="button" className="button button-primary" onClick={openNewProfile}>
               <Plus size={14} /> Add Backup Drive
             </button>
           </>
@@ -467,11 +476,7 @@ export const DriveBackupView: React.FC = () => {
           title="No external backup drives registered"
           description="Plug in your external SSD/HDD and register it by Volume UUID so TruongSync tracks backup freshness and verifies everything is up to date."
           actions={
-            <button
-              type="button"
-              className="button button-primary"
-              onClick={() => openEditor({ ...BLANK_EXTERNAL })}
-            >
+            <button type="button" className="button button-primary" onClick={openNewProfile}>
               <Plus size={14} /> Add Backup Drive
             </button>
           }

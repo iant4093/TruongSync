@@ -117,7 +117,7 @@ pub fn sanitize_segment(input: &str) -> String {
     while s.ends_with('.') || s.ends_with(' ') {
         s.pop();
     }
-    let trimmed_dots = s.trim_start_matches('.').trim().to_string();
+    let trimmed_dots = s.trim_start_matches(['.', ' ']).trim().to_string();
     s = trimmed_dots;
     if s.is_empty() || s == "." || s == ".." {
         return "Untitled".into();

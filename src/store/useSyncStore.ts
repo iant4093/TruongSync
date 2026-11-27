@@ -20,6 +20,7 @@ import { notifyError, notifyInfo, notifySuccess } from './feedback';
 interface SyncStore {
   activeNav: NavTab;
   bootstrapped: boolean;
+  toolsChecked: boolean;
   bootstrap: BootstrapInfo | null;
   tools: ToolsStatus | null;
   settings: AppSettings | null;
@@ -54,6 +55,11 @@ interface SyncStore {
 
 let listenersAttached = false;
 let initInFlight: Promise<void> | null = null;
+let volumesSeq = 0;
+let toolsSeq = 0;
+let profilesSeq = 0;
+let jobsSeq = 0;
+let settingsSeq = 0;
 
 function latestProgress(map: Record<string, JobProgressEvent>): JobProgressEvent | null {
   const vals = Object.values(map);
@@ -63,6 +69,7 @@ function latestProgress(map: Record<string, JobProgressEvent>): JobProgressEvent
 export const useSyncStore = create<SyncStore>((set, get) => ({
   activeNav: 'import',
   bootstrapped: false,
+  toolsChecked: false,
   bootstrap: null,
   tools: null,
   settings: null,
@@ -98,7 +105,7 @@ export const useSyncStore = create<SyncStore>((set, get) => ({
 
   init: async () => {
     if (!isTauri()) {
-      set({ bootstrapped: true });
+      set({ bootstrapped: true, toolsChecked: true });
       return;
     }
     if (get().bootstrapped) return;
@@ -116,6 +123,7 @@ export const useSyncStore = create<SyncStore>((set, get) => ({
             });
           }),
           listen<DetectedVolume[]>('volumes-changed', (ev) => {
+            volumesSeq += 1;
             set({ volumes: ev.payload });
           }),
           listen<NavTab>('navigate-tab', (ev) => {
@@ -165,15 +173,34 @@ export const useSyncStore = create<SyncStore>((set, get) => ({
       }
 
       // Fire slow OS probes (exiftool/rclone subprocesses & diskutil volume scan) concurrently
-      // WITHOUT blocking first paint on fast SQLite queries.
+      // WITHOUT blocking first paint on fast SQLite queries, guarded by monotonic sequence IDs
+      // so stale startup responses never overwrite newer live events or manual refreshes.
+      const initToolsSeq = ++toolsSeq;
       const toolsPromise = api
         .checkTools()
-        .then((tools) => set({ tools }))
-        .catch(() => {});
+        .then((tools) => {
+          if (initToolsSeq === toolsSeq) {
+            set({ tools, toolsChecked: true });
+          }
+        })
+        .catch(() => {
+          if (initToolsSeq === toolsSeq) {
+            set({ toolsChecked: true });
+          }
+        });
+      const initVolumesSeq = ++volumesSeq;
       const volumesPromise = api
         .listVolumes()
-        .then((volumes) => set({ volumes }))
+        .then((volumes) => {
+          if (initVolumesSeq === volumesSeq) {
+            set({ volumes });
+          }
+        })
         .catch(() => {});
+
+      const initSettingsSeq = ++settingsSeq;
+      const initProfilesSeq = ++profilesSeq;
+      const initJobsSeq = ++jobsSeq;
 
       const fastResults = await Promise.allSettled([
         api.getBootstrapInfo(),
@@ -188,11 +215,17 @@ export const useSyncStore = create<SyncStore>((set, get) => ({
         fastResults[0].status === 'fulfilled' ? fastResults[0].value.initial_import_volume : null;
       const patch: Partial<SyncStore> = { bootstrapped: true };
       if (fastResults[0].status === 'fulfilled') patch.bootstrap = fastResults[0].value;
-      if (fastResults[1].status === 'fulfilled') patch.settings = fastResults[1].value;
-      if (fastResults[2].status === 'fulfilled') patch.presets = fastResults[2].value;
-      if (fastResults[3].status === 'fulfilled') patch.cloudProfiles = fastResults[3].value;
-      if (fastResults[4].status === 'fulfilled') patch.externalProfiles = fastResults[4].value;
-      if (fastResults[5].status === 'fulfilled') patch.jobs = fastResults[5].value;
+      if (fastResults[1].status === 'fulfilled' && initSettingsSeq === settingsSeq) {
+        patch.settings = fastResults[1].value;
+      }
+      if (initProfilesSeq === profilesSeq) {
+        if (fastResults[2].status === 'fulfilled') patch.presets = fastResults[2].value;
+        if (fastResults[3].status === 'fulfilled') patch.cloudProfiles = fastResults[3].value;
+        if (fastResults[4].status === 'fulfilled') patch.externalProfiles = fastResults[4].value;
+      }
+      if (fastResults[5].status === 'fulfilled' && initJobsSeq === jobsSeq) {
+        patch.jobs = fastResults[5].value;
+      }
 
       set((state) => ({
         ...patch,
@@ -214,9 +247,12 @@ export const useSyncStore = create<SyncStore>((set, get) => ({
 
   refreshVolumes: async () => {
     if (!isTauri()) return;
+    const seq = ++volumesSeq;
     try {
       const volumes = await api.listVolumes();
-      set({ volumes });
+      if (seq === volumesSeq) {
+        set({ volumes });
+      }
     } catch {
       // ignore transient volume poll error
     }
@@ -224,11 +260,13 @@ export const useSyncStore = create<SyncStore>((set, get) => ({
 
   refreshProfiles: async () => {
     if (!isTauri()) return;
+    const seq = ++profilesSeq;
     const [cloudRes, extRes, presetRes] = await Promise.allSettled([
       api.listCloudProfiles(),
       api.listExternalProfiles(),
       api.listImportPresets(),
     ]);
+    if (seq !== profilesSeq) return;
     const patch: Partial<SyncStore> = {};
     if (cloudRes.status === 'fulfilled') patch.cloudProfiles = cloudRes.value;
     if (extRes.status === 'fulfilled') patch.externalProfiles = extRes.value;
@@ -238,9 +276,12 @@ export const useSyncStore = create<SyncStore>((set, get) => ({
 
   refreshJobs: async () => {
     if (!isTauri()) return;
+    const seq = ++jobsSeq;
     try {
       const jobs = await api.listJobs(100);
-      set({ jobs });
+      if (seq === jobsSeq) {
+        set({ jobs });
+      }
     } catch {
       // ignore
     }
@@ -248,19 +289,27 @@ export const useSyncStore = create<SyncStore>((set, get) => ({
 
   refreshTools: async () => {
     if (!isTauri()) return;
+    const seq = ++toolsSeq;
     try {
       const tools = await api.checkTools();
-      set({ tools });
+      if (seq === toolsSeq) {
+        set({ tools, toolsChecked: true });
+      }
     } catch {
-      // ignore
+      if (seq === toolsSeq) {
+        set({ toolsChecked: true });
+      }
     }
   },
 
   refreshSettings: async () => {
     if (!isTauri()) return;
+    const seq = ++settingsSeq;
     try {
       const settings = await api.getSettings();
-      set({ settings });
+      if (seq === settingsSeq) {
+        set({ settings });
+      }
     } catch {
       // ignore
     }

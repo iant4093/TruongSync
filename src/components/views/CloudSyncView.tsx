@@ -50,6 +50,7 @@ function cloudVerifyStamp(p: CloudProfile): string {
 export const CloudSyncView: React.FC = () => {
   const cloudProfiles = useSyncStore((s) => s.cloudProfiles);
   const tools = useSyncStore((s) => s.tools);
+  const toolsReady = useSyncStore((s) => s.toolsChecked || s.tools !== null);
   const refreshProfiles = useSyncStore((s) => s.refreshProfiles);
   const refreshTools = useSyncStore((s) => s.refreshTools);
   const refreshJobs = useSyncStore((s) => s.refreshJobs);
@@ -66,12 +67,13 @@ export const CloudSyncView: React.FC = () => {
   const [reportSyncStamps, setReportSyncStamps] = useState<Record<string, string>>({});
 
   // Auto-invalidate stale verify reports whenever a profile completes a full/partial sync,
-  // restore, or background verify check.
+  // restore, or background verify check (skip while a re-verify is in-flight to prevent flicker).
   useEffect(() => {
     setVerifyReports((prev) => {
       let changed = false;
       const next = { ...prev };
       for (const id of Object.keys(prev)) {
+        if (busyMap[id] === 'verify') continue;
         const p = cloudProfiles.find((c) => c.id === id);
         if (!p || cloudVerifyStamp(p) !== reportSyncStamps[id]) {
           delete next[id];
@@ -80,12 +82,18 @@ export const CloudSyncView: React.FC = () => {
       }
       return changed ? next : prev;
     });
-  }, [cloudProfiles, reportSyncStamps]);
+  }, [cloudProfiles, reportSyncStamps, busyMap]);
 
   const openEditor = (profile: CloudProfile) => {
     setEditing(profile);
     setStaleDaysText(String(profile.stale_after_days || 7));
   };
+
+  const openNewProfile = () =>
+    openEditor({
+      ...BLANK_PROFILE,
+      remote_name: tools?.rclone_remotes[0] ?? 'rawphotos',
+    });
 
   const setProfileBusy = (id: string, kind: 'verify' | 'sync' | null) => {
     setBusyMap((prev) => {
@@ -176,10 +184,20 @@ export const CloudSyncView: React.FC = () => {
       const rep = await api.verifyCloud(profileId, deepMd5);
       await refreshProfiles();
       const freshProfile = useSyncStore.getState().cloudProfiles.find((c) => c.id === profileId);
-      if (freshProfile) {
+      const superseded = Boolean(
+        freshProfile?.last_sync_at &&
+          Date.parse(freshProfile.last_sync_at) > Date.parse(rep.checked_at),
+      );
+      if (freshProfile && !superseded) {
         setReportSyncStamps((prev) => ({ ...prev, [profileId]: cloudVerifyStamp(freshProfile) }));
+        setVerifyReports((prev) => ({ ...prev, [profileId]: rep }));
+      } else if (superseded) {
+        setVerifyReports((prev) => {
+          const next = { ...prev };
+          delete next[profileId];
+          return next;
+        });
       }
-      setVerifyReports((prev) => ({ ...prev, [profileId]: rep }));
       notifySuccess(
         `Verified: ${rep.up_to_date_count.toLocaleString()} up to date, ↑${rep.missing_on_remote.length} upload, ↓${rep.missing_on_local.length} download.`,
       );
@@ -265,16 +283,7 @@ export const CloudSyncView: React.FC = () => {
             >
               <Link2 size={14} /> Connect Google Drive
             </button>
-            <button
-              type="button"
-              className="button button-primary"
-              onClick={() =>
-                openEditor({
-                  ...BLANK_PROFILE,
-                  remote_name: tools?.rclone_remotes[0] ?? 'rawphotos',
-                })
-              }
-            >
+            <button type="button" className="button button-primary" onClick={openNewProfile}>
               <Plus size={14} /> Add Profile
             </button>
           </>
@@ -285,16 +294,20 @@ export const CloudSyncView: React.FC = () => {
       <div className="card" style={{ marginBottom: 16 }}>
         <div className="card-body row-between">
           <div className="row-wrap">
-            <Badge tone={tools?.rclone.available ? 'ok' : 'danger'}>
+            <Badge tone={!toolsReady ? 'muted' : tools?.rclone.available ? 'ok' : 'danger'}>
               rclone:{' '}
-              {tools?.rclone.available
-                ? `${tools.rclone.bundled ? 'Bundled · ' : ''}${tools.rclone.version}`
-                : 'Not installed'}
+              {!toolsReady
+                ? 'Checking…'
+                : tools?.rclone.available
+                  ? `${tools.rclone.bundled ? 'Bundled · ' : ''}${tools.rclone.version}`
+                  : 'Not installed'}
             </Badge>
-            <Badge tone={tools?.rclone_config_exists ? 'ok' : 'warn'}>
-              {tools?.rclone_config_exists
-                ? `Remotes: ${tools.rclone_remotes.join(', ') || 'Configured'}`
-                : 'No Google Drive remote linked'}
+            <Badge tone={!toolsReady ? 'muted' : tools?.rclone_config_exists ? 'ok' : 'warn'}>
+              {!toolsReady
+                ? 'Checking Google Drive remotes…'
+                : tools?.rclone_config_exists
+                  ? `Remotes: ${tools.rclone_remotes.join(', ') || 'Configured'}`
+                  : 'No Google Drive remote linked'}
             </Badge>
             <Badge>Policy: 2-Way Additive · Never Deletes</Badge>
           </div>
@@ -510,11 +523,7 @@ export const CloudSyncView: React.FC = () => {
           title="No Google Drive sync profiles yet"
           description="Add a profile mapping any local library folder (e.g., Photo Dump or Edited Photos) to a Google Drive folder. Your existing Drive hierarchy works out of the box."
           actions={
-            <button
-              type="button"
-              className="button button-primary"
-              onClick={() => openEditor({ ...BLANK_PROFILE })}
-            >
+            <button type="button" className="button button-primary" onClick={openNewProfile}>
               <Plus size={14} /> Add Cloud Profile
             </button>
           }

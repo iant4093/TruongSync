@@ -114,6 +114,7 @@ export const ImportView: React.FC = () => {
   const pendingAutoImportPath = useSyncStore((s) => s.pendingAutoImportPath);
   const setPendingAutoImportPath = useSyncStore((s) => s.setPendingAutoImportPath);
   const refreshVolumes = useSyncStore((s) => s.refreshVolumes);
+  const refreshProfiles = useSyncStore((s) => s.refreshProfiles);
   const refreshJobs = useSyncStore((s) => s.refreshJobs);
   const refreshSettings = useSyncStore((s) => s.refreshSettings);
 
@@ -200,9 +201,7 @@ export const ImportView: React.FC = () => {
     } else if (prev && !running) {
       prevPresetRef.current = p;
       if (prev.root_path !== p.root_path) {
-        setDestRoot((cur) => p.root_path || settings?.default_import_root || cur);
-      } else if (!destRoot && (p.root_path || settings?.default_import_root)) {
-        setDestRoot(p.root_path || settings?.default_import_root || '');
+        setDestRoot((cur) => (!cur || cur === prev.root_path ? p.root_path : cur));
       }
       if (prev.folder_template !== p.folder_template) setFolderTemplate(p.folder_template);
       if (prev.date_format !== p.date_format) setDateFormat(p.date_format);
@@ -214,8 +213,6 @@ export const ImportView: React.FC = () => {
       }
       if (prev.auto_geotag !== p.auto_geotag) setGeotagEnabled(p.auto_geotag);
       if (prev.eject_after !== p.eject_after) setEjectAfter(p.eject_after);
-    } else if (!destRoot && (p.root_path || settings?.default_import_root)) {
-      setDestRoot(p.root_path || settings?.default_import_root || '');
     }
   }, [presets, selectedPresetId, settings?.default_import_root, running]);
 
@@ -230,14 +227,13 @@ export const ImportView: React.FC = () => {
     setSelectedExternalIds((prev) => prev.filter((id) => validExt.has(id)));
   }, [externalProfiles]);
 
-  // Handle auto-open from SD card arrival
+  // Handle auto-open from SD card arrival (defer while an import pipeline is actively running)
   useEffect(() => {
-    if (pendingAutoImportPath) {
-      const path = pendingAutoImportPath;
-      setPendingAutoImportPath(null);
-      void handleScanSource(path);
-    }
-  }, [pendingAutoImportPath]);
+    if (!pendingAutoImportPath || running) return;
+    const path = pendingAutoImportPath;
+    setPendingAutoImportPath(null);
+    void handleScanSource(path);
+  }, [pendingAutoImportPath, running]);
 
   // Load dynamic year categories whenever destRoot, folderDate, or default_categories changes
   useEffect(() => {
@@ -759,7 +755,7 @@ export const ImportView: React.FC = () => {
                           if (settings && !settings.default_import_root.trim()) {
                             void api
                               .saveSettings({ ...settings, default_import_root: d })
-                              .then(() => refreshSettings())
+                              .then(() => Promise.all([refreshSettings(), refreshProfiles()]))
                               .catch(() => {});
                           }
                         }

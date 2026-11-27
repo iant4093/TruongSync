@@ -1,4 +1,4 @@
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use anyhow::Context;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};

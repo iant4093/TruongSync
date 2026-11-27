@@ -33,6 +33,7 @@ export const Sidebar: React.FC = () => {
   const cloudProfiles = useSyncStore((s) => s.cloudProfiles);
   const hasActiveJob = useSyncStore((s) => s.activeProgress !== null);
   const tools = useSyncStore((s) => s.tools);
+  const toolsReady = useSyncStore((s) => s.toolsChecked || s.tools !== null);
 
   const sdCount = volumes.filter((v) => v.has_dcim).length;
   const driveConnected = Boolean(tools?.rclone.available && tools?.rclone_config_exists);
@@ -80,7 +81,9 @@ export const Sidebar: React.FC = () => {
                 className={`ws-dot ${driveConnected ? (staleCloud ? 'is-warn' : 'is-connected') : ''}`}
                 aria-hidden="true"
               />
-              <span>{driveConnected ? (staleCloud ? 'Pending' : 'Ready') : 'Not linked'}</span>
+              <span>
+                {!toolsReady ? 'Checking…' : driveConnected ? (staleCloud ? 'Pending' : 'Ready') : 'Not linked'}
+              </span>
             </span>
           </div>
           <div className="resource-row">

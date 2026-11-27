@@ -378,6 +378,11 @@ struct WorkerOutcome {
     failures: Vec<(String, String)>,
 }
 
+struct ProgressGate {
+    last_emit: Instant,
+    last_done: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_exiftool_worker<N, F, U>(
     bin: &Path,
@@ -386,7 +391,7 @@ fn run_exiftool_worker<N, F, U>(
     bump_mtime: bool,
     cancel: &CancellationToken,
     done_counter: &std::sync::atomic::AtomicUsize,
-    last_emit: &std::sync::Mutex<Instant>,
+    progress_gate: &std::sync::Mutex<ProgressGate>,
     needs_md5: &N,
     on_progress: &F,
     on_updated: &U,
@@ -399,24 +404,23 @@ where
     const PER_FILE_TIMEOUT: Duration = Duration::from_secs(120);
     use std::sync::atomic::Ordering;
 
-    let emit_progress = |filename: &str| {
-        let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let should_emit = if done == total {
-            true
-        } else if let Ok(mut guard) = last_emit.try_lock() {
-            if guard.elapsed() >= Duration::from_millis(80) {
-                *guard = Instant::now();
-                true
-            } else {
-                false
+    let advance_progress = |delta: usize, filename: &str| {
+        if delta == 0 {
+            return;
+        }
+        let done = (done_counter.fetch_add(delta, Ordering::Relaxed) + delta).min(total);
+        if let Ok(mut gate) = progress_gate.lock() {
+            let is_final = done >= total;
+            if done > gate.last_done
+                && (is_final || gate.last_emit.elapsed() >= Duration::from_millis(80))
+            {
+                gate.last_done = done;
+                gate.last_emit = Instant::now();
+                on_progress(done, total, filename);
             }
-        } else {
-            false
-        };
-        if should_emit {
-            on_progress(done, total, filename);
         }
     };
+    let emit_progress = |filename: &str| advance_progress(1, filename);
 
     let mut cmd = new_exiftool_cmd(bin);
     #[allow(unused_mut)]
@@ -640,6 +644,7 @@ where
                     "Skipped after ExifTool process exited unexpectedly".into(),
                 ));
             }
+            advance_progress(shard.len() - idx, &item.filename);
             break;
         }
 
@@ -772,6 +777,7 @@ where
                     "Skipped after ExifTool process terminated early".into(),
                 ));
             }
+            advance_progress(shard.len().saturating_sub(idx + 1), &item.filename);
             break;
         }
     }
@@ -873,6 +879,7 @@ where
     })?;
 
     let mut to_write: Vec<&PhotoGpsMatch> = Vec::new();
+    let mut seen_canon_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut skipped_count = 0usize;
     let mut failures: Vec<(String, String)> = Vec::new();
 
@@ -902,6 +909,13 @@ where
             ));
             continue;
         }
+        // Deduplicate by canonical path BEFORE sharding across concurrent ExifTool workers
+        // so two processes can never race on the same `<file>_exiftool_tmp` temp file.
+        let dedup_key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if !seen_canon_paths.insert(dedup_key) {
+            skipped_count += 1;
+            continue;
+        }
         to_write.push(item);
     }
 
@@ -928,51 +942,70 @@ where
     };
 
     let done_counter = std::sync::atomic::AtomicUsize::new(0);
-    let last_emit = std::sync::Mutex::new(Instant::now() - Duration::from_secs(1));
+    let progress_gate = std::sync::Mutex::new(ProgressGate {
+        last_emit: Instant::now() - Duration::from_secs(1),
+        last_done: 0,
+    });
 
     let mut shards: Vec<Vec<&PhotoGpsMatch>> = (0..worker_count).map(|_| Vec::new()).collect();
     for (idx, item) in to_write.into_iter().enumerate() {
         shards[idx % worker_count].push(item);
     }
+    let active_shards: Vec<&[&PhotoGpsMatch]> = shards
+        .iter()
+        .filter(|sh| !sh.is_empty())
+        .map(|sh| sh.as_slice())
+        .collect();
 
-    let worker_results: Vec<Result<WorkerOutcome>> = if worker_count == 1 {
-        vec![run_exiftool_worker(
-            &bin,
-            &shards[0],
-            total,
-            bump_mtime,
-            cancel,
-            &done_counter,
-            &last_emit,
-            &needs_md5,
-            &on_progress,
-            &on_updated,
+    let worker_results: Vec<(&[&PhotoGpsMatch], Result<WorkerOutcome>)> = if active_shards.len()
+        == 1
+    {
+        let sh = active_shards[0];
+        vec![(
+            sh,
+            run_exiftool_worker(
+                &bin,
+                sh,
+                total,
+                bump_mtime,
+                cancel,
+                &done_counter,
+                &progress_gate,
+                &needs_md5,
+                &on_progress,
+                &on_updated,
+            ),
         )]
     } else {
         std::thread::scope(|s| {
-            let handles: Vec<_> = shards
+            let handles: Vec<_> = active_shards
                 .iter()
-                .filter(|sh| !sh.is_empty())
-                .map(|sh| {
+                .map(|&sh| {
                     let bin_ref = &bin;
                     let done_ref = &done_counter;
-                    let emit_ref = &last_emit;
+                    let gate_ref = &progress_gate;
                     let needs_ref = &needs_md5;
                     let prog_ref = &on_progress;
                     let upd_ref = &on_updated;
-                    s.spawn(move || {
-                        run_exiftool_worker(
-                            bin_ref, sh, total, bump_mtime, cancel, done_ref, emit_ref, needs_ref,
-                            prog_ref, upd_ref,
-                        )
-                    })
+                    (
+                        sh,
+                        s.spawn(move || {
+                            run_exiftool_worker(
+                                bin_ref, sh, total, bump_mtime, cancel, done_ref, gate_ref,
+                                needs_ref, prog_ref, upd_ref,
+                            )
+                        }),
+                    )
                 })
                 .collect();
             handles
                 .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err(anyhow!("ExifTool worker thread panicked")))
+                .map(|(sh, h)| {
+                    (
+                        sh,
+                        h.join()
+                            .unwrap_or_else(|_| Err(anyhow!("ExifTool worker thread panicked"))),
+                    )
                 })
                 .collect()
         })
@@ -981,11 +1014,13 @@ where
     let mut tagged_count = 0usize;
     let mut was_cancelled = false;
     let mut updated_records = Vec::new();
-    let mut first_spawn_err: Option<anyhow::Error> = None;
+    let mut any_worker_ok = false;
+    let mut failed_shards: Vec<(&[&PhotoGpsMatch], anyhow::Error)> = Vec::new();
 
-    for res in worker_results {
+    for (sh, res) in worker_results {
         match res {
             Ok(out) => {
+                any_worker_ok = true;
                 tagged_count += out.tagged_count;
                 skipped_count += out.skipped_count;
                 was_cancelled |= out.was_cancelled;
@@ -993,18 +1028,36 @@ where
                 failures.extend(out.failures);
             }
             Err(err) => {
-                if first_spawn_err.is_none() {
-                    first_spawn_err = Some(err);
-                }
+                failed_shards.push((sh, err));
             }
         }
     }
 
-    if let Some(err) = first_spawn_err {
-        if tagged_count == 0 && skipped_count == 0 && failures.is_empty() {
-            return Err(err);
+    if !any_worker_ok {
+        if let Some((_, first_err)) = failed_shards.into_iter().next() {
+            return Err(first_err);
         }
-        failures.push((String::new(), err.to_string()));
+    } else if !failed_shards.is_empty() {
+        for (sh, err) in failed_shards {
+            let msg = err.to_string();
+            for item in sh {
+                failures.push((item.path.clone(), msg.clone()));
+            }
+            let done = (done_counter.fetch_add(sh.len(), std::sync::atomic::Ordering::Relaxed)
+                + sh.len())
+            .min(total);
+            if let Ok(mut gate) = progress_gate.lock() {
+                if done > gate.last_done && done >= total {
+                    gate.last_done = done;
+                    gate.last_emit = Instant::now();
+                    on_progress(
+                        done,
+                        total,
+                        sh.last().map(|i| i.filename.as_str()).unwrap_or(""),
+                    );
+                }
+            }
+        }
     }
 
     Ok(GeotagExecutionResult {

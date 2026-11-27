@@ -10,9 +10,40 @@ const GpxMapPreview = React.lazy(() =>
   import('../GpxMapPreview').then((m) => ({ default: m.GpxMapPreview })),
 );
 
+class MapErrorBoundary extends React.Component<
+  { resetKey: GeotagPlan; children: React.ReactNode },
+  { hasError: boolean }
+> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidUpdate(prevProps: { resetKey: GeotagPlan }) {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.hasError) {
+      this.setState({ hasError: false });
+    }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="card">
+          <div className="card-body muted">
+            Map preview could not be loaded — matched photo coordinates are listed below and ready to write.
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export const GeotagView: React.FC = () => {
   const settings = useSyncStore((s) => s.settings);
   const tools = useSyncStore((s) => s.tools);
+  const toolsReady = useSyncStore((s) => s.toolsChecked || s.tools !== null);
   const refreshJobs = useSyncStore((s) => s.refreshJobs);
 
   const [targetFolder, setTargetFolder] = useState('');
@@ -84,7 +115,7 @@ export const GeotagView: React.FC = () => {
   };
 
   const handlePreview = async () => {
-    if (!targetFolder || gpxFiles.length === 0) {
+    if (!targetFolder.trim() || gpxFiles.length === 0) {
       notifyError('Choose both a target shoot folder and at least one .gpx track.');
       return;
     }
@@ -164,16 +195,18 @@ export const GeotagView: React.FC = () => {
         title="EXIF GPS Geotagging"
         subtitle="Embed GPS coordinates from universal .gpx files directly into RAW & JPEG EXIF. Videos and out-of-range frames are strictly skipped."
         actions={
-          <Badge tone={tools?.exiftool.available ? 'ok' : 'danger'}>
+          <Badge tone={!toolsReady ? 'muted' : tools?.exiftool.available ? 'ok' : 'danger'}>
             ExifTool:{' '}
-            {tools?.exiftool.available
-              ? `${tools.exiftool.bundled ? 'Bundled · ' : ''}v${tools.exiftool.version}`
-              : 'Not found'}
+            {!toolsReady
+              ? 'Checking…'
+              : tools?.exiftool.available
+                ? `${tools.exiftool.bundled ? 'Bundled · ' : ''}v${tools.exiftool.version}`
+                : 'Not found'}
           </Badge>
         }
       />
 
-      {!tools?.exiftool.available && (
+      {toolsReady && !tools?.exiftool.available && (
         <div className="error-banner">
           ExifTool was not detected. Install it (e.g. <code>brew install exiftool</code> on macOS) or configure its path in Settings to write GPS into RAW &amp; JPEG EXIF.
         </div>
@@ -319,7 +352,7 @@ export const GeotagView: React.FC = () => {
             <button
               type="button"
               className="button button-primary"
-              disabled={loading || writing || !targetFolder || gpxFiles.length === 0 || !maxGapValid}
+              disabled={loading || writing || !targetFolder.trim() || gpxFiles.length === 0 || !maxGapValid}
               onClick={() => void handlePreview()}
             >
               <Play size={14} /> {loading ? 'Matching…' : 'Match & Preview on Map'}
@@ -365,15 +398,17 @@ export const GeotagView: React.FC = () => {
               </span>
             </div>
           )}
-          <React.Suspense
-            fallback={
-              <div className="card">
-                <div className="card-body muted">Loading interactive GPX map preview…</div>
-              </div>
-            }
-          >
-            <GpxMapPreview plan={plan} />
-          </React.Suspense>
+          <MapErrorBoundary resetKey={plan}>
+            <React.Suspense
+              fallback={
+                <div className="card">
+                  <div className="card-body muted">Loading interactive GPX map preview…</div>
+                </div>
+              }
+            >
+              <GpxMapPreview plan={plan} />
+            </React.Suspense>
+          </MapErrorBoundary>
 
           <div className="row-between" style={{ marginTop: 16, marginBottom: 10 }}>
             <SegmentedControl
