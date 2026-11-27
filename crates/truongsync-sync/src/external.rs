@@ -15,7 +15,7 @@ use truongsync_db::models::{
     is_mac_metadata_path, relative_normalized, AppSettings, ExternalProfile, ManifestEntry,
 };
 use truongsync_db::DbHandle;
-use truongsync_geo::exiftool::compute_file_md5;
+use truongsync_geo::exiftool::{compute_file_md5, compute_file_md5_with_buf};
 use truongsync_ingest::volumes::{disk_free_bytes, find_mounted_volume, DetectedVolume};
 use walkdir::WalkDir;
 
@@ -99,7 +99,15 @@ fn scan_dir(
         }
         return Ok((map, exact_collisions, 0));
     }
-    for entry_res in WalkDir::new(root).follow_links(false) {
+    for entry_res in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            e.depth() == 0
+                || !e.file_type().is_dir()
+                || !is_mac_metadata_path(&e.file_name().to_string_lossy())
+        })
+    {
         if cancel.is_cancelled() {
             return Err(anyhow!("Sync cancelled."));
         }
@@ -202,7 +210,7 @@ pub fn verify_external_profile_cancellable(
             pending_bytes: 0,
         });
     };
-    // Verify the resolved mount point is still present and target path doesn't escape via symlink
+    // Verify the resolved mount point is still present, capture device identity, and ensure target doesn't escape via symlink
     let mount_path = Path::new(&vol.mount_path);
     if !mount_path.is_dir() {
         return Err(anyhow!(
@@ -218,11 +226,13 @@ pub fn verify_external_profile_cancellable(
         ));
     }
     crate::cloud::ensure_no_symlink_ancestors(mount_path, &ext_root)?;
+    let expected_identity = capture_mount_identity(mount_path, &profile.volume_label)?;
     Ok(verify_external_roots_inner(
         profile,
         Path::new(&profile.local_root),
         &ext_root,
-        Some(vol.mount_path),
+        Some(vol.mount_path.clone()),
+        Some((mount_path, expected_identity.as_ref())),
         db,
         deep_md5,
         false,
@@ -247,6 +257,7 @@ pub fn verify_external_roots(
         local_root,
         ext_root,
         Some(ext_root.to_string_lossy().to_string()),
+        None,
         db,
         deep_md5,
         restore_mode,
@@ -261,15 +272,26 @@ fn verify_external_roots_inner(
     local_root: &Path,
     ext_root: &Path,
     mounted_path: Option<String>,
+    mount_guard: Option<(&Path, Option<&MountIdentity>)>,
     db: &DbHandle,
     deep_md5: bool,
     restore_mode: bool,
     cancel: &CancellationToken,
 ) -> Result<ExternalVerifyContext> {
-    let (local_map, local_exact_dups, local_mac) =
-        scan_dir(local_root, !restore_mode, false, cancel)?;
     let ext_root_exists = ext_root.exists();
-    let (ext_map, ext_exact_dups, ext_mac) = scan_dir(ext_root, false, true, cancel)?;
+    let (local_res, ext_res) = std::thread::scope(|s| {
+        let local_handle = s.spawn(|| scan_dir(local_root, !restore_mode, false, cancel));
+        let ext_res = scan_dir(ext_root, false, true, cancel);
+        let local_res = local_handle
+            .join()
+            .unwrap_or_else(|_| Err(anyhow!("local scan thread panicked")));
+        (local_res, ext_res)
+    });
+    let (local_map, local_exact_dups, local_mac) = local_res?;
+    let (ext_map, ext_exact_dups, ext_mac) = ext_res?;
+    // Immediately verify the external mount identity survived the directory walk so a
+    // mid-scan disconnect never misclassifies the entire library as "missing on external".
+    check_mount_device_identity(mount_guard)?;
 
     let manifest = db.load_manifest_map("external", &profile.id)?;
     let pending_updates =
@@ -311,6 +333,96 @@ fn verify_external_roots_inner(
         .into_iter()
         .collect();
     keys.sort();
+
+    // Pre-compute needed MD5s (deep_md5 or GPS backfill candidates) in parallel across up to 4 threads
+    // using reused per-thread 1 MiB buffers.
+    let mut md5_targets: HashSet<&Path> = HashSet::new();
+    for &rel in &keys {
+        if local_exact_dups.contains(rel) || ext_exact_dups.contains(rel) {
+            continue;
+        }
+        let lower = rel.to_lowercase();
+        let loc_bucket_len = local_lower_groups.get(&lower).map_or(0, Vec::len);
+        let ext_bucket_len = ext_lower_groups.get(&lower).map_or(0, Vec::len);
+        if loc_bucket_len > 1 || ext_bucket_len > 1 {
+            continue;
+        }
+        match (local_map.get(rel), ext_map.get(rel)) {
+            (Some(l), Some(e)) => {
+                if intentional_by_rel.contains_key(rel) || (deep_md5 && l.size == e.size) {
+                    md5_targets.insert(l.abs_path.as_path());
+                    md5_targets.insert(e.abs_path.as_path());
+                }
+            }
+            (Some(l), None) if deep_md5 => {
+                if let Some(ext_variant) = ext_lower_groups.get(&lower).and_then(|v| v.first()) {
+                    let e = &ext_map[ext_variant];
+                    if l.size == e.size {
+                        md5_targets.insert(l.abs_path.as_path());
+                        md5_targets.insert(e.abs_path.as_path());
+                    }
+                }
+            }
+            (None, Some(e)) if deep_md5 => {
+                if let Some(loc_variant) = local_lower_groups.get(&lower).and_then(|v| v.first()) {
+                    let l = &local_map[loc_variant];
+                    if l.size == e.size {
+                        md5_targets.insert(l.abs_path.as_path());
+                        md5_targets.insert(e.abs_path.as_path());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let precomputed_md5s: HashMap<PathBuf, Result<String, String>> = if md5_targets.len() > 1 {
+        let targets: Vec<PathBuf> = md5_targets.into_iter().map(Path::to_path_buf).collect();
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 4);
+        if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+            pool.install(|| {
+                targets
+                    .par_iter()
+                    .map_init(
+                        || vec![0u8; 1024 * 1024],
+                        |buf, p| {
+                            if cancel.is_cancelled() {
+                                return (p.clone(), Err("Sync cancelled.".to_string()));
+                            }
+                            let res = compute_file_md5_with_buf(p, buf).map_err(|e| e.to_string());
+                            (p.clone(), res)
+                        },
+                    )
+                    .collect()
+            })
+        } else {
+            let mut buf = vec![0u8; 1024 * 1024];
+            targets
+                .into_iter()
+                .map(|p| {
+                    let res = compute_file_md5_with_buf(&p, &mut buf).map_err(|e| e.to_string());
+                    (p, res)
+                })
+                .collect()
+        }
+    } else if md5_targets.len() == 1 {
+        let p = md5_targets.into_iter().next().unwrap().to_path_buf();
+        let res = compute_file_md5(&p).map_err(|e| e.to_string());
+        HashMap::from([(p, res)])
+    } else {
+        HashMap::new()
+    };
+    if !precomputed_md5s.is_empty() {
+        check_mount_device_identity(mount_guard)?;
+    }
+    let lookup_md5 = |p: &Path| -> Result<String, String> {
+        if let Some(res) = precomputed_md5s.get(p) {
+            return res.clone();
+        }
+        compute_file_md5(p).map_err(|e| e.to_string())
+    };
 
     let two_way = profile.direction == "two_way_additive";
     let mut to_push = Vec::new();
@@ -370,7 +482,7 @@ fn verify_external_roots_inner(
                         let same = if l.size != e.size {
                             false
                         } else if deep_md5 {
-                            match (compute_file_md5(&l.abs_path), compute_file_md5(&e.abs_path)) {
+                            match (lookup_md5(&l.abs_path), lookup_md5(&e.abs_path)) {
                                 (Ok(lm), Ok(em)) => lm == em,
                                 _ => false,
                             }
@@ -409,7 +521,7 @@ fn verify_external_roots_inner(
                         let same = if l.size != e.size {
                             false
                         } else if deep_md5 {
-                            match (compute_file_md5(&l.abs_path), compute_file_md5(&e.abs_path)) {
+                            match (lookup_md5(&l.abs_path), lookup_md5(&e.abs_path)) {
                                 (Ok(lm), Ok(em)) => lm == em,
                                 _ => false,
                             }
@@ -464,7 +576,7 @@ fn verify_external_roots_inner(
             (Some(l), Some(e)) => {
                 if let Some((ids, pre_set, post_md5)) = intentional_by_rel.get(rel) {
                     if let (Ok(ext_md5), Ok(loc_md5)) =
-                        (compute_file_md5(&e.abs_path), compute_file_md5(&l.abs_path))
+                        (lookup_md5(&e.abs_path), lookup_md5(&l.abs_path))
                     {
                         if ext_md5.eq_ignore_ascii_case(post_md5) {
                             auto_applied_update_ids.extend(ids.iter().cloned());
@@ -492,7 +604,7 @@ fn verify_external_roots_inner(
                 let content_same = if !size_same {
                     false
                 } else if deep_md5 {
-                    match (compute_file_md5(&l.abs_path), compute_file_md5(&e.abs_path)) {
+                    match (lookup_md5(&l.abs_path), lookup_md5(&e.abs_path)) {
                         (Ok(lm), Ok(em)) => lm == em,
                         (Err(err), _) => {
                             hash_error_note = Some(format!(
@@ -513,15 +625,25 @@ fn verify_external_roots_inner(
 
                 if content_same {
                     up_to_date_count += 1;
-                    confirmed_both.push(ManifestEntry {
-                        profile_kind: "external".into(),
-                        profile_id: profile.id.clone(),
-                        rel_path: rel.clone(),
-                        size_bytes: l.size as i64,
-                        md5_hash: None,
-                        mtime_unix: l.mtime_unix,
-                        state: "synced".into(),
-                    });
+                    let needs_upsert = match manifest.get(rel) {
+                        Some(existing) => {
+                            existing.size_bytes != l.size as i64
+                                || existing.mtime_unix != l.mtime_unix
+                                || existing.state != "synced"
+                        }
+                        None => true,
+                    };
+                    if needs_upsert {
+                        confirmed_both.push(ManifestEntry {
+                            profile_kind: "external".into(),
+                            profile_id: profile.id.clone(),
+                            rel_path: rel.clone(),
+                            size_bytes: l.size as i64,
+                            md5_hash: None,
+                            mtime_unix: l.mtime_unix,
+                            state: "synced".into(),
+                        });
+                    }
                 } else {
                     conflicts.push(SyncDiffItem {
                         rel_path: rel.clone(),
@@ -869,6 +991,30 @@ fn check_mount_device_identity(mount_check: Option<(&Path, Option<&MountIdentity
     Ok(())
 }
 
+fn capture_mount_identity(mount_path: &Path, volume_label: &str) -> Result<Option<MountIdentity>> {
+    let mount_meta = std::fs::metadata(mount_path).map_err(|_| {
+        anyhow!(
+            "External drive '{}' disconnected before operation could start.",
+            volume_label
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Some(MountIdentity::UnixDev(mount_meta.dev())))
+    }
+    #[cfg(windows)]
+    {
+        let _ = mount_meta;
+        Ok(query_windows_volume_guid(mount_path).map(MountIdentity::WindowsVolumeGuid))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = mount_meta;
+        Ok(None)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn atomic_copy_preserve_mtime(
     dst_root: &Path,
@@ -877,21 +1023,42 @@ fn atomic_copy_preserve_mtime(
     allow_overwrite: bool,
     expected_src_md5: Option<&str>,
     expected_dst_pre_md5s: Option<&HashSet<String>>,
+    skip_parent_setup: bool,
+    buf: &mut [u8],
     cancel: &CancellationToken,
-) -> Result<u64> {
-    crate::cloud::ensure_no_symlink_ancestors(dst_root, dst)?;
-    if !allow_overwrite && dst.symlink_metadata().is_ok() {
+) -> Result<(u64, i64)> {
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    if !skip_parent_setup {
+        crate::cloud::ensure_no_symlink_ancestors(dst_root, dst)?;
+        std::fs::create_dir_all(parent)?;
+    } else if let Ok(meta) = dst.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            return Err(anyhow!(
+                "Refusing to traverse symlink inside sync root: {}",
+                dst.display()
+            ));
+        }
+        if !allow_overwrite {
+            return Err(anyhow!(
+                "Destination file already exists; strictly-additive sync refused overwrite: {}",
+                dst.display()
+            ));
+        }
+    }
+    if !skip_parent_setup && !allow_overwrite && dst.symlink_metadata().is_ok() {
         return Err(anyhow!(
             "Destination file already exists; strictly-additive sync refused overwrite: {}",
             dst.display()
         ));
     }
-    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
 
     let meta = std::fs::metadata(src)?;
     let expected = meta.len();
     let mtime = meta.modified().ok();
+    let mtime_unix = mtime
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let seq = EXT_PART_SEQ.fetch_add(1, Ordering::Relaxed);
     // Short fixed-length sibling temp file prevents ENAMETOOLONG / Windows MAX_PATH overflow
     let part = parent.join(format!(
@@ -907,7 +1074,6 @@ fn atomic_copy_preserve_mtime(
         .create_new(true)
         .open(&part)?;
     use md5::Digest;
-    let mut buf = vec![0u8; 2 * 1024 * 1024];
     let mut copied = 0u64;
     let mut hasher = expected_src_md5.map(|_| md5::Md5::new());
     loop {
@@ -915,7 +1081,7 @@ fn atomic_copy_preserve_mtime(
             drop(w);
             return Err(anyhow!("Sync cancelled."));
         }
-        let n = match r.read(&mut buf) {
+        let n = match r.read(buf) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -928,12 +1094,13 @@ fn atomic_copy_preserve_mtime(
         }
         copied += n as u64;
     }
-    // Flush data BEFORE set_modified so exFAT/FAT32/Windows flush never clobbers preserved mtime
-    w.sync_all()?;
+    // Flush data BEFORE set_modified so exFAT/FAT32/Windows flush never clobbers preserved mtime,
+    // then issue a single full sync_all() durability barrier.
     if let Some(mt) = mtime {
+        w.sync_data()?;
         let _ = w.set_modified(mt);
-        let _ = w.sync_all();
     }
+    w.sync_all()?;
     drop(w);
     if copied != expected {
         return Err(anyhow!("size mismatch copying {}", src.display()));
@@ -949,7 +1116,7 @@ fn atomic_copy_preserve_mtime(
         }
     }
     if let Some(pre_set) = expected_dst_pre_md5s {
-        let live_dst_md5 = compute_file_md5(dst)?;
+        let live_dst_md5 = compute_file_md5_with_buf(dst, buf)?;
         if !pre_set.contains(&live_dst_md5.to_ascii_lowercase()) {
             return Err(anyhow!(
                 "Aborted GPS backfill: destination changed before atomic replace for {}",
@@ -959,7 +1126,7 @@ fn atomic_copy_preserve_mtime(
     }
     commit_part_file(&part, dst, allow_overwrite)?;
     guard.disarm();
-    Ok(copied)
+    Ok((copied, mtime_unix))
 }
 
 /// Runs 2-way strictly-additive sync with an external drive (matching `Backup-Photos.ps1`).
@@ -992,27 +1159,7 @@ where
         ));
     }
     crate::cloud::ensure_no_symlink_ancestors(&mount_path, &ext_root)?;
-    let mount_meta = std::fs::metadata(&mount_path).map_err(|_| {
-        anyhow!(
-            "External drive '{}' disconnected before sync could start.",
-            profile.volume_label
-        )
-    })?;
-    #[cfg(unix)]
-    let expected_identity = {
-        use std::os::unix::fs::MetadataExt;
-        Some(MountIdentity::UnixDev(mount_meta.dev()))
-    };
-    #[cfg(windows)]
-    let expected_identity = {
-        let _ = mount_meta;
-        query_windows_volume_guid(&mount_path).map(MountIdentity::WindowsVolumeGuid)
-    };
-    #[cfg(not(any(unix, windows)))]
-    let expected_identity: Option<MountIdentity> = {
-        let _ = mount_meta;
-        None
-    };
+    let expected_identity = capture_mount_identity(&mount_path, &profile.volume_label)?;
 
     sync_external_roots_with_mount_guard(
         profile,
@@ -1096,6 +1243,7 @@ where
         local_root,
         ext_root,
         Some(ext_root.to_string_lossy().to_string()),
+        mount_guard,
         db,
         false,
         restore_mode,
@@ -1162,6 +1310,35 @@ where
         std::fs::create_dir_all(ext_root)?;
     }
 
+    // Pre-validate symlink safety and pre-create every unique destination parent directory once
+    // before entering the parallel copy loops (eliminates redundant per-file stat walks).
+    let mut validated_local_parents: HashSet<PathBuf> = HashSet::new();
+    for rel in &pulls {
+        let dst = join_rel_path(local_root, rel);
+        let parent = dst.parent().unwrap_or(local_root).to_path_buf();
+        if !validated_local_parents.contains(&parent)
+            && crate::cloud::ensure_no_symlink_ancestors(local_root, &parent).is_ok()
+            && std::fs::create_dir_all(&parent).is_ok()
+        {
+            validated_local_parents.insert(parent);
+        }
+    }
+    let mut validated_ext_parents: HashSet<PathBuf> = HashSet::new();
+    for rel in pushes.iter().chain(backfills.iter()) {
+        let dst = ctx
+            .ext_map
+            .get(rel)
+            .map(|e| e.abs_path.clone())
+            .unwrap_or_else(|| join_rel_path(ext_root, rel));
+        let parent = dst.parent().unwrap_or(ext_root).to_path_buf();
+        if !validated_ext_parents.contains(&parent)
+            && crate::cloud::ensure_no_symlink_ancestors(ext_root, &parent).is_ok()
+            && std::fs::create_dir_all(&parent).is_ok()
+        {
+            validated_ext_parents.insert(parent);
+        }
+    }
+
     let total_ops = pulls.len() + pushes.len() + backfills.len();
     let done = Arc::new(AtomicUsize::new(0));
     let bytes = Arc::new(AtomicU64::new(0));
@@ -1171,13 +1348,52 @@ where
     let pull_failures = Arc::new(AtomicUsize::new(0));
     let push_failures = Arc::new(AtomicUsize::new(0));
     let failures: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let succeeded_rels: Arc<Mutex<Vec<(String, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
+    let succeeded_rels: Arc<Mutex<Vec<(String, u64, i64)>>> = Arc::new(Mutex::new(Vec::new()));
     let applied_update_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let last_mount_check_ms = AtomicU64::new(0);
+    let last_progress_emit = Mutex::new(Instant::now() - std::time::Duration::from_secs(1));
     // Use a child cancellation token for drive-disconnect aborts so we stop in-flight copies
     // immediately WITHOUT poisoning the caller's `cancel` token (which would misreport
     // disconnects as user cancellation and abort multi-drive pipelines).
     let worker_cancel = cancel.child_token();
     let disconnect_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let maybe_check_mount = |force: bool| -> Result<()> {
+        if mount_guard.is_none() {
+            return Ok(());
+        }
+        let now_ms = started.elapsed().as_millis() as u64;
+        if !force {
+            let prev = last_mount_check_ms.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(prev) < 200 {
+                return Ok(());
+            }
+            if last_mount_check_ms
+                .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+        check_mount_device_identity(mount_guard)
+    };
+
+    let emit_progress = |msg: &str, d: usize, b: u64| {
+        let should = if d >= total_ops {
+            true
+        } else {
+            let mut g = last_progress_emit.lock();
+            if g.elapsed().as_millis() >= 80 {
+                *g = Instant::now();
+                true
+            } else {
+                false
+            }
+        };
+        if should {
+            on_progress(msg, d, total_ops, b);
+        }
+    };
 
     let workers = settings.import_threads.clamp(1, 8);
     let pool = rayon::ThreadPoolBuilder::new()
@@ -1191,177 +1407,228 @@ where
 
     pool.install(|| {
         // Pass 1: External -> PC (strictly non-overwriting!)
-        pulls.par_iter().for_each(|rel| {
-            if worker_cancel.is_cancelled() {
-                return;
-            }
-            if let Err(e) = check_mount_device_identity(mount_guard) {
-                pull_failures.fetch_add(1, Ordering::Relaxed);
-                let msg = e.to_string();
-                let mut d_err = disconnect_err.lock();
-                if d_err.is_none() {
-                    *d_err = Some(msg.clone());
+        pulls.par_iter().for_each_init(
+            || vec![0u8; 2 * 1024 * 1024],
+            |io_buf, rel| {
+                if worker_cancel.is_cancelled() {
+                    return;
                 }
-                drop(d_err);
-                failures.lock().push((rel.clone(), msg));
-                worker_cancel.cancel();
-                return;
-            }
-            let src = ext_map
-                .get(rel)
-                .map(|e| e.abs_path.clone())
-                .unwrap_or_else(|| join_rel_path(ext_root, rel));
-            let dst = join_rel_path(local_root, rel);
-            match atomic_copy_preserve_mtime(
-                local_root,
-                &src,
-                &dst,
-                false,
-                None,
-                None,
-                &worker_cancel,
-            ) {
-                Ok(n) => {
-                    pulled.fetch_add(1, Ordering::Relaxed);
-                    succeeded_rels.lock().push((rel.clone(), dst));
-                    let b = bytes.fetch_add(n, Ordering::Relaxed) + n;
-                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    on_progress(&format!("Pulling {rel}"), d, total_ops, b);
-                }
-                Err(e) if !worker_cancel.is_cancelled() => {
+                if let Err(e) = maybe_check_mount(false) {
                     pull_failures.fetch_add(1, Ordering::Relaxed);
-                    failures.lock().push((rel.clone(), e.to_string()));
+                    let msg = e.to_string();
+                    let mut d_err = disconnect_err.lock();
+                    if d_err.is_none() {
+                        *d_err = Some(msg.clone());
+                    }
+                    drop(d_err);
+                    failures.lock().push((rel.clone(), msg));
+                    worker_cancel.cancel();
+                    return;
                 }
-                Err(_) => {}
-            }
-        });
+                let src = ext_map
+                    .get(rel)
+                    .map(|e| e.abs_path.clone())
+                    .unwrap_or_else(|| join_rel_path(ext_root, rel));
+                let dst = join_rel_path(local_root, rel);
+                let skip_parent = dst
+                    .parent()
+                    .is_some_and(|p| validated_local_parents.contains(p));
+                match atomic_copy_preserve_mtime(
+                    local_root,
+                    &src,
+                    &dst,
+                    false,
+                    None,
+                    None,
+                    skip_parent,
+                    io_buf,
+                    &worker_cancel,
+                ) {
+                    Ok((n, mtime_unix)) => {
+                        pulled.fetch_add(1, Ordering::Relaxed);
+                        succeeded_rels.lock().push((rel.clone(), n, mtime_unix));
+                        let b = bytes.fetch_add(n, Ordering::Relaxed) + n;
+                        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        emit_progress(&format!("Pulling {rel}"), d, b);
+                    }
+                    Err(e) if !worker_cancel.is_cancelled() => {
+                        if let Err(me) = maybe_check_mount(true) {
+                            let msg = me.to_string();
+                            let mut d_err = disconnect_err.lock();
+                            if d_err.is_none() {
+                                *d_err = Some(msg.clone());
+                            }
+                            drop(d_err);
+                            pull_failures.fetch_add(1, Ordering::Relaxed);
+                            failures.lock().push((rel.clone(), msg));
+                            worker_cancel.cancel();
+                            return;
+                        }
+                        pull_failures.fetch_add(1, Ordering::Relaxed);
+                        failures.lock().push((rel.clone(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
+            },
+        );
 
         // Pass 2: PC -> External (strictly non-overwriting!)
-        pushes.par_iter().for_each(|rel| {
-            if worker_cancel.is_cancelled() {
-                return;
-            }
-            if let Err(e) = check_mount_device_identity(mount_guard) {
-                push_failures.fetch_add(1, Ordering::Relaxed);
-                let msg = e.to_string();
-                let mut d_err = disconnect_err.lock();
-                if d_err.is_none() {
-                    *d_err = Some(msg.clone());
+        pushes.par_iter().for_each_init(
+            || vec![0u8; 2 * 1024 * 1024],
+            |io_buf, rel| {
+                if worker_cancel.is_cancelled() {
+                    return;
                 }
-                drop(d_err);
-                failures.lock().push((rel.clone(), msg));
-                worker_cancel.cancel();
-                return;
-            }
-            let src = local_map
-                .get(rel)
-                .map(|l| l.abs_path.clone())
-                .unwrap_or_else(|| join_rel_path(local_root, rel));
-            let dst = join_rel_path(ext_root, rel);
-            match atomic_copy_preserve_mtime(
-                ext_root,
-                &src,
-                &dst,
-                false,
-                None,
-                None,
-                &worker_cancel,
-            ) {
-                Ok(n) => {
-                    pushed.fetch_add(1, Ordering::Relaxed);
-                    succeeded_rels.lock().push((rel.clone(), src));
-                    let b = bytes.fetch_add(n, Ordering::Relaxed) + n;
-                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    on_progress(&format!("Copying {rel}"), d, total_ops, b);
-                }
-                Err(e) if !worker_cancel.is_cancelled() => {
+                if let Err(e) = maybe_check_mount(false) {
                     push_failures.fetch_add(1, Ordering::Relaxed);
-                    failures.lock().push((rel.clone(), e.to_string()));
+                    let msg = e.to_string();
+                    let mut d_err = disconnect_err.lock();
+                    if d_err.is_none() {
+                        *d_err = Some(msg.clone());
+                    }
+                    drop(d_err);
+                    failures.lock().push((rel.clone(), msg));
+                    worker_cancel.cancel();
+                    return;
                 }
-                Err(_) => {}
-            }
-        });
+                let src = local_map
+                    .get(rel)
+                    .map(|l| l.abs_path.clone())
+                    .unwrap_or_else(|| join_rel_path(local_root, rel));
+                let dst = join_rel_path(ext_root, rel);
+                let skip_parent = dst
+                    .parent()
+                    .is_some_and(|p| validated_ext_parents.contains(p));
+                match atomic_copy_preserve_mtime(
+                    ext_root,
+                    &src,
+                    &dst,
+                    false,
+                    None,
+                    None,
+                    skip_parent,
+                    io_buf,
+                    &worker_cancel,
+                ) {
+                    Ok((n, mtime_unix)) => {
+                        pushed.fetch_add(1, Ordering::Relaxed);
+                        succeeded_rels.lock().push((rel.clone(), n, mtime_unix));
+                        let b = bytes.fetch_add(n, Ordering::Relaxed) + n;
+                        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        emit_progress(&format!("Copying {rel}"), d, b);
+                    }
+                    Err(e) if !worker_cancel.is_cancelled() => {
+                        if let Err(me) = maybe_check_mount(true) {
+                            let msg = me.to_string();
+                            let mut d_err = disconnect_err.lock();
+                            if d_err.is_none() {
+                                *d_err = Some(msg.clone());
+                            }
+                            drop(d_err);
+                            push_failures.fetch_add(1, Ordering::Relaxed);
+                            failures.lock().push((rel.clone(), msg));
+                            worker_cancel.cancel();
+                            return;
+                        }
+                        push_failures.fetch_add(1, Ordering::Relaxed);
+                        failures.lock().push((rel.clone(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
+            },
+        );
 
         // Pass 3: Safe GPS backfill updates (stream-hashes copied bytes == post_md5 & re-verifies ext pre_md5!)
-        backfills.par_iter().for_each(|rel| {
-            if worker_cancel.is_cancelled() {
-                return;
-            }
-            if let Err(e) = check_mount_device_identity(mount_guard) {
-                push_failures.fetch_add(1, Ordering::Relaxed);
-                let msg = e.to_string();
-                let mut d_err = disconnect_err.lock();
-                if d_err.is_none() {
-                    *d_err = Some(msg.clone());
+        backfills.par_iter().for_each_init(
+            || vec![0u8; 2 * 1024 * 1024],
+            |io_buf, rel| {
+                if worker_cancel.is_cancelled() {
+                    return;
                 }
-                drop(d_err);
-                failures.lock().push((rel.clone(), msg));
-                worker_cancel.cancel();
-                return;
-            }
-            let src = local_map
-                .get(rel)
-                .map(|l| l.abs_path.clone())
-                .unwrap_or_else(|| join_rel_path(local_root, rel));
-            let dst = ext_map
-                .get(rel)
-                .map(|e| e.abs_path.clone())
-                .unwrap_or_else(|| join_rel_path(ext_root, rel));
-            let Some((ids, pre_set, post_md5)) = grouped_updates.get(rel) else {
-                push_failures.fetch_add(1, Ordering::Relaxed);
-                failures
-                    .lock()
-                    .push((rel.clone(), "Missing intentional update metadata".into()));
-                return;
-            };
-            // Stream-verify copied bytes == post_md5 AND re-verify dst == pre_set right before commit!
-            match atomic_copy_preserve_mtime(
-                ext_root,
-                &src,
-                &dst,
-                true,
-                Some(post_md5.as_str()),
-                Some(pre_set),
-                &worker_cancel,
-            ) {
-                Ok(n) => {
-                    backfilled.fetch_add(1, Ordering::Relaxed);
-                    succeeded_rels.lock().push((rel.clone(), src));
-                    applied_update_ids.lock().extend(ids.iter().cloned());
-                    let b = bytes.fetch_add(n, Ordering::Relaxed) + n;
-                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    on_progress(&format!("Updating geotagged {rel}"), d, total_ops, b);
-                }
-                Err(e) if !worker_cancel.is_cancelled() => {
+                if let Err(e) = maybe_check_mount(false) {
                     push_failures.fetch_add(1, Ordering::Relaxed);
-                    failures.lock().push((rel.clone(), e.to_string()));
+                    let msg = e.to_string();
+                    let mut d_err = disconnect_err.lock();
+                    if d_err.is_none() {
+                        *d_err = Some(msg.clone());
+                    }
+                    drop(d_err);
+                    failures.lock().push((rel.clone(), msg));
+                    worker_cancel.cancel();
+                    return;
                 }
-                Err(_) => {}
-            }
-        });
+                let src = local_map
+                    .get(rel)
+                    .map(|l| l.abs_path.clone())
+                    .unwrap_or_else(|| join_rel_path(local_root, rel));
+                let dst = ext_map
+                    .get(rel)
+                    .map(|e| e.abs_path.clone())
+                    .unwrap_or_else(|| join_rel_path(ext_root, rel));
+                let Some((ids, pre_set, post_md5)) = grouped_updates.get(rel) else {
+                    push_failures.fetch_add(1, Ordering::Relaxed);
+                    failures
+                        .lock()
+                        .push((rel.clone(), "Missing intentional update metadata".into()));
+                    return;
+                };
+                let skip_parent = dst
+                    .parent()
+                    .is_some_and(|p| validated_ext_parents.contains(p));
+                // Stream-verify copied bytes == post_md5 AND re-verify dst == pre_set right before commit!
+                match atomic_copy_preserve_mtime(
+                    ext_root,
+                    &src,
+                    &dst,
+                    true,
+                    Some(post_md5.as_str()),
+                    Some(pre_set),
+                    skip_parent,
+                    io_buf,
+                    &worker_cancel,
+                ) {
+                    Ok((n, mtime_unix)) => {
+                        backfilled.fetch_add(1, Ordering::Relaxed);
+                        succeeded_rels.lock().push((rel.clone(), n, mtime_unix));
+                        applied_update_ids.lock().extend(ids.iter().cloned());
+                        let b = bytes.fetch_add(n, Ordering::Relaxed) + n;
+                        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        emit_progress(&format!("Updating geotagged {rel}"), d, b);
+                    }
+                    Err(e) if !worker_cancel.is_cancelled() => {
+                        if let Err(me) = maybe_check_mount(true) {
+                            let msg = me.to_string();
+                            let mut d_err = disconnect_err.lock();
+                            if d_err.is_none() {
+                                *d_err = Some(msg.clone());
+                            }
+                            drop(d_err);
+                            push_failures.fetch_add(1, Ordering::Relaxed);
+                            failures.lock().push((rel.clone(), msg));
+                            worker_cancel.cancel();
+                            return;
+                        }
+                        push_failures.fetch_add(1, Ordering::Relaxed);
+                        failures.lock().push((rel.clone(), e.to_string()));
+                    }
+                    Err(_) => {}
+                }
+            },
+        );
     });
 
-    // Record manifest ONLY for files that actually transferred cleanly
+    // Record manifest ONLY for files that actually transferred cleanly (reusing copied size & mtime)
     let ok_entries: Vec<ManifestEntry> = succeeded_rels
         .lock()
         .iter()
-        .filter_map(|(rel, local_path)| {
-            let meta = std::fs::metadata(local_path).ok()?;
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            Some(ManifestEntry {
-                profile_kind: "external".into(),
-                profile_id: profile.id.clone(),
-                rel_path: rel.clone(),
-                size_bytes: meta.len() as i64,
-                md5_hash: None,
-                mtime_unix: mtime,
-                state: "synced".into(),
-            })
+        .map(|(rel, size, mtime_unix)| ManifestEntry {
+            profile_kind: "external".into(),
+            profile_id: profile.id.clone(),
+            rel_path: rel.clone(),
+            size_bytes: *size as i64,
+            md5_hash: None,
+            mtime_unix: *mtime_unix,
+            state: "synced".into(),
         })
         .collect();
     let _ = db.upsert_manifest_entries(&ok_entries);
@@ -1378,6 +1645,9 @@ where
     if cancel.is_cancelled() {
         return Err(anyhow!("Sync cancelled."));
     }
+
+    // Mandatory final unthrottled mount identity check before declaring sync complete
+    check_mount_device_identity(mount_guard)?;
 
     let failed_list = failures.lock().clone();
     let failed_count = failed_list.len();

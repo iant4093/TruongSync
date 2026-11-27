@@ -4,7 +4,7 @@ use nom_exif::{EntryValue, Exif, ExifTag, MediaParser, MediaSource};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -186,28 +186,33 @@ pub fn resolve_local_naive_to_utc(naive: NaiveDateTime) -> DateTime<Utc> {
         .unwrap_or_else(|| Utc.from_utc_datetime(&naive))
 }
 
-fn read_capture_timestamp(path: &Path, kind: MediaKind) -> (NaiveDate, Option<DateTime<Utc>>) {
+fn read_capture_timestamp_with_parser(
+    path: &Path,
+    kind: MediaKind,
+    mtime_fallback: Option<SystemTime>,
+    parser: &mut MediaParser,
+) -> (NaiveDate, Option<DateTime<Utc>>) {
     if matches!(kind, MediaKind::Raw | MediaKind::Jpeg) {
-        if let Some((camera_date, dt_utc)) = read_exif_capture_time(path) {
+        if let Some((camera_date, dt_utc)) = read_exif_capture_time(path, parser) {
             return (camera_date, Some(dt_utc));
         }
     } else if matches!(kind, MediaKind::Video) {
-        if let Some((video_date, dt_utc)) = read_video_capture_time(path) {
+        if let Some((video_date, dt_utc)) = read_video_capture_time(path, parser) {
             return (video_date, Some(dt_utc));
         }
     }
-    if let Ok(meta) = std::fs::metadata(path) {
-        if let Ok(mtime) = meta.modified() {
-            let dt_utc: DateTime<Utc> = mtime.into();
-            return (dt_utc.with_timezone(&Local).date_naive(), Some(dt_utc));
-        }
+    if let Some(mtime) = mtime_fallback.or_else(|| std::fs::metadata(path).ok()?.modified().ok()) {
+        let dt_utc: DateTime<Utc> = mtime.into();
+        return (dt_utc.with_timezone(&Local).date_naive(), Some(dt_utc));
     }
     let now = Local::now();
     (now.date_naive(), Some(now.with_timezone(&Utc)))
 }
 
-fn read_video_capture_time(path: &Path) -> Option<(NaiveDate, DateTime<Utc>)> {
-    let mut parser = MediaParser::new();
+fn read_video_capture_time(
+    path: &Path,
+    parser: &mut MediaParser,
+) -> Option<(NaiveDate, DateTime<Utc>)> {
     let ms = MediaSource::open(path).ok()?;
     let info: nom_exif::TrackInfo = parser.parse_track(ms).ok()?;
     let val = info.get(nom_exif::TrackInfoTag::CreateDate)?;
@@ -220,8 +225,10 @@ fn read_video_capture_time(path: &Path) -> Option<(NaiveDate, DateTime<Utc>)> {
     }
 }
 
-fn read_exif_capture_time(path: &Path) -> Option<(NaiveDate, DateTime<Utc>)> {
-    let mut parser = MediaParser::new();
+fn read_exif_capture_time(
+    path: &Path,
+    parser: &mut MediaParser,
+) -> Option<(NaiveDate, DateTime<Utc>)> {
     let ms = MediaSource::open(path).ok()?;
     let iter = parser.parse_exif(ms).ok()?;
     let exif: Exif = iter.into();
@@ -335,7 +342,7 @@ pub fn scan_media_source(source: &Path, settings: &AppSettings) -> Result<CardSc
                     continue;
                 }
                 if let Some(kind) = classify_extension(p, settings) {
-                    candidate_paths.push((p.to_path_buf(), kind));
+                    candidate_paths.push((p.to_path_buf(), kind, entry.metadata().ok()));
                 }
             }
         }
@@ -345,20 +352,24 @@ pub fn scan_media_source(source: &Path, settings: &AppSettings) -> Result<CardSc
     let unreadable: Mutex<Vec<String>> = Mutex::new(walk_errors);
     let scanned: Vec<ScannedMediaFile> = candidate_paths
         .par_iter()
-        .filter_map(|(path, kind)| {
-            let meta = match std::fs::metadata(path) {
-                Ok(m) => m,
-                Err(_) => {
-                    unreadable.lock().push(path.to_string_lossy().to_string());
-                    return None;
-                }
+        .map_init(MediaParser::new, |parser, (path, kind, pre_meta)| {
+            let meta = match pre_meta.as_ref() {
+                Some(m) => m.clone(),
+                None => match std::fs::metadata(path) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        unreadable.lock().push(path.to_string_lossy().to_string());
+                        return None;
+                    }
+                },
             };
             if File::open(path).is_err() {
                 unreadable.lock().push(path.to_string_lossy().to_string());
                 return None;
             }
             let size = meta.len();
-            let (date, dt_utc) = read_capture_timestamp(path, *kind);
+            let (date, dt_utc) =
+                read_capture_timestamp_with_parser(path, *kind, meta.modified().ok(), parser);
             Some(ScannedMediaFile {
                 path: path.to_string_lossy().to_string(),
                 filename: path
@@ -372,6 +383,7 @@ pub fn scan_media_source(source: &Path, settings: &AppSettings) -> Result<CardSc
                 suspicious_zero_bytes: size == 0,
             })
         })
+        .flatten()
         .collect();
 
     let mut groups: BTreeMap<String, DateGroupSummary> = BTreeMap::new();
@@ -700,105 +712,145 @@ where
         .build()
         .context("failed to build ingest thread pool")?;
 
-    pool.install(|| {
-        plan.par_iter().for_each(|item| {
-            if cancel.is_cancelled() {
-                return;
-            }
-            let src = Path::new(&item.source_path);
-            let dst = Path::new(&item.dest_path);
+    // Process in chunks of 64 so Move mode batches `sync_parent_dir` ONCE per unique dirty
+    // destination directory per chunk before unlinking verified SD sources (up to 64x fewer
+    // F_FULLFSYNC directory barriers with identical crash durability).
+    for chunk in plan.chunks(64) {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let pending_unlinks: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+        pool.install(|| {
+            chunk.par_iter().for_each_init(
+                || vec![0u8; 2 * 1024 * 1024],
+                |io_buf, item| {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    let src = Path::new(&item.source_path);
+                    let dst = Path::new(&item.dest_path);
 
-            match transfer_single_file(src, dst, is_move, deep_verify, cancel, &reserved_dests) {
-                Ok(SingleOutcome::Transferred(final_dst, nbytes)) => {
-                    shoot_roots_set.lock().insert(item.shoot_root.clone());
-                    files_moved.fetch_add(1, Ordering::Relaxed);
-                    let bd = bytes_done.fetch_add(nbytes, Ordering::Relaxed) + nbytes;
-                    let fd = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if matches!(item.kind, MediaKind::Raw | MediaKind::Jpeg) {
-                        dest_photos
-                            .lock()
-                            .push(final_dst.to_string_lossy().to_string());
+                    match transfer_single_file(
+                        src,
+                        dst,
+                        deep_verify,
+                        cancel,
+                        &reserved_dests,
+                        io_buf,
+                    ) {
+                        Ok(SingleOutcome::Transferred(final_dst, nbytes)) => {
+                            shoot_roots_set.lock().insert(item.shoot_root.clone());
+                            files_moved.fetch_add(1, Ordering::Relaxed);
+                            let bd = bytes_done.fetch_add(nbytes, Ordering::Relaxed) + nbytes;
+                            let fd = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                            if matches!(item.kind, MediaKind::Raw | MediaKind::Jpeg) {
+                                dest_photos
+                                    .lock()
+                                    .push(final_dst.to_string_lossy().to_string());
+                            }
+                            if is_move {
+                                pending_unlinks.lock().push((src.to_path_buf(), final_dst));
+                            }
+                            emit_throttled(
+                                &last_emit,
+                                &on_progress,
+                                started,
+                                files_total,
+                                fd,
+                                bytes_total,
+                                bd,
+                                &item.source_path,
+                            );
+                        }
+                        Ok(SingleOutcome::SkippedDuplicate(final_dst)) => {
+                            shoot_roots_set.lock().insert(item.shoot_root.clone());
+                            files_skipped.fetch_add(1, Ordering::Relaxed);
+                            let bd = bytes_done.load(Ordering::Relaxed);
+                            let fd = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                            if matches!(item.kind, MediaKind::Raw | MediaKind::Jpeg) {
+                                let p = final_dst.to_string_lossy().to_string();
+                                dest_photos.lock().push(p.clone());
+                                dup_photos.lock().push(p);
+                            }
+                            emit_throttled(
+                                &last_emit,
+                                &on_progress,
+                                started,
+                                files_total,
+                                fd,
+                                bytes_total,
+                                bd,
+                                &item.source_path,
+                            );
+                        }
+                        Ok(SingleOutcome::Cancelled) => {}
+                        Err(err) => {
+                            files_failed.fetch_add(1, Ordering::Relaxed);
+                            let fd = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                            failures
+                                .lock()
+                                .push((item.source_path.clone(), err.to_string()));
+                            emit_throttled(
+                                &last_emit,
+                                &on_progress,
+                                started,
+                                files_total,
+                                fd,
+                                bytes_total,
+                                bytes_done.load(Ordering::Relaxed),
+                                &item.source_path,
+                            );
+                        }
                     }
-                    emit_throttled(
-                        &last_emit,
-                        &on_progress,
-                        started,
-                        files_total,
-                        fd,
-                        bytes_total,
-                        bd,
-                        &item.source_path,
-                    );
-                }
-                Ok(SingleOutcome::TransferredSourceKept {
-                    dest: final_dst,
-                    bytes: nbytes,
-                    reason,
-                }) => {
-                    shoot_roots_set.lock().insert(item.shoot_root.clone());
-                    files_moved.fetch_add(1, Ordering::Relaxed);
-                    files_failed.fetch_add(1, Ordering::Relaxed);
-                    let bd = bytes_done.fetch_add(nbytes, Ordering::Relaxed) + nbytes;
-                    let fd = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if matches!(item.kind, MediaKind::Raw | MediaKind::Jpeg) {
-                        dest_photos
-                            .lock()
-                            .push(final_dst.to_string_lossy().to_string());
+                },
+            );
+        });
+
+        if is_move {
+            let unlinks = pending_unlinks.into_inner();
+            if !unlinks.is_empty() {
+                let mut synced_dirs: HashMap<PathBuf, Result<(), String>> = HashMap::new();
+                for (_, final_dst) in &unlinks {
+                    let parent = final_dst.parent().unwrap_or_else(|| Path::new("."));
+                    if !synced_dirs.contains_key(parent) {
+                        let res = sync_parent_dir(final_dst).map_err(|e| e.to_string());
+                        synced_dirs.insert(parent.to_path_buf(), res);
                     }
-                    failures.lock().push((item.source_path.clone(), reason));
-                    emit_throttled(
-                        &last_emit,
-                        &on_progress,
-                        started,
-                        files_total,
-                        fd,
-                        bytes_total,
-                        bd,
-                        &item.source_path,
-                    );
                 }
-                Ok(SingleOutcome::SkippedDuplicate(final_dst)) => {
-                    shoot_roots_set.lock().insert(item.shoot_root.clone());
-                    files_skipped.fetch_add(1, Ordering::Relaxed);
-                    let bd = bytes_done.load(Ordering::Relaxed);
-                    let fd = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if matches!(item.kind, MediaKind::Raw | MediaKind::Jpeg) {
-                        let p = final_dst.to_string_lossy().to_string();
-                        dest_photos.lock().push(p.clone());
-                        dup_photos.lock().push(p);
+                for (src, final_dst) in unlinks {
+                    let parent = final_dst.parent().unwrap_or_else(|| Path::new("."));
+                    if let Some(Err(sync_err)) = synced_dirs.get(parent) {
+                        files_failed.fetch_add(1, Ordering::Relaxed);
+                        failures.lock().push((
+                            src.to_string_lossy().to_string(),
+                            format!(
+                                "Destination directory fsync failed before source removal (source kept safely): {sync_err}"
+                            ),
+                        ));
+                        continue;
                     }
-                    emit_throttled(
-                        &last_emit,
-                        &on_progress,
-                        started,
-                        files_total,
-                        fd,
-                        bytes_total,
-                        bd,
-                        &item.source_path,
-                    );
-                }
-                Ok(SingleOutcome::Cancelled) => {}
-                Err(err) => {
-                    files_failed.fetch_add(1, Ordering::Relaxed);
-                    let fd = files_done.fetch_add(1, Ordering::Relaxed) + 1;
-                    failures
-                        .lock()
-                        .push((item.source_path.clone(), err.to_string()));
-                    emit_throttled(
-                        &last_emit,
-                        &on_progress,
-                        started,
-                        files_total,
-                        fd,
-                        bytes_total,
-                        bytes_done.load(Ordering::Relaxed),
-                        &item.source_path,
-                    );
+                    if is_same_file_path(&src, &final_dst) {
+                        files_failed.fetch_add(1, Ordering::Relaxed);
+                        failures.lock().push((
+                            src.to_string_lossy().to_string(),
+                            "Refusing to delete source because source and destination resolve to the same file".into(),
+                        ));
+                        continue;
+                    }
+                    if let Err(err) = std::fs::remove_file(&src) {
+                        files_failed.fetch_add(1, Ordering::Relaxed);
+                        failures.lock().push((
+                            src.to_string_lossy().to_string(),
+                            format!(
+                                "File safely copied to {}, but source could not be removed (possibly camera-protected/locked): {err}",
+                                final_dst.display()
+                            ),
+                        ));
+                    }
                 }
             }
-        });
-    });
+        }
+    }
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let total_bd = bytes_done.load(Ordering::Relaxed);
@@ -878,12 +930,6 @@ fn emit_throttled<F>(
 
 enum SingleOutcome {
     Transferred(PathBuf, u64),
-    /// File was verified and placed safely at destination, but source could not be removed (e.g. camera-locked photo).
-    TransferredSourceKept {
-        dest: PathBuf,
-        bytes: u64,
-        reason: String,
-    },
     SkippedDuplicate(PathBuf),
     Cancelled,
 }
@@ -936,6 +982,7 @@ fn hash_file_blake3(
     path: &Path,
     cancel: &CancellationToken,
     bypass_cache: bool,
+    buf: &mut [u8],
 ) -> Result<Option<blake3::Hash>> {
     let mut file = File::open(path)?;
     #[cfg(target_os = "macos")]
@@ -948,12 +995,11 @@ fn hash_file_blake3(
     #[cfg(not(target_os = "macos"))]
     let _ = bypass_cache;
     let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 2 * 1024 * 1024];
     loop {
         if cancel.is_cancelled() {
             return Ok(None);
         }
-        match file.read(&mut buf) {
+        match file.read(buf) {
             Ok(0) => break,
             Ok(n) => {
                 hasher.update(&buf[..n]);
@@ -1138,10 +1184,10 @@ fn sync_parent_dir(path: &Path) -> Result<()> {
 fn transfer_single_file(
     src: &Path,
     dst: &Path,
-    is_move: bool,
     deep_verify: bool,
     cancel: &CancellationToken,
     reserved_dests: &Mutex<HashSet<String>>,
+    buf: &mut [u8],
 ) -> Result<SingleOutcome> {
     if is_same_file_path(src, dst) {
         return Ok(SingleOutcome::SkippedDuplicate(dst.to_path_buf()));
@@ -1156,10 +1202,10 @@ fn transfer_single_file(
     if let Ok(dst_meta) = std::fs::metadata(dst) {
         if dst_meta.is_file() && dst_meta.len() == src_len {
             let same = if deep_verify || src_len > 0 {
-                let Some(src_h) = hash_file_blake3(src, cancel, false)? else {
+                let Some(src_h) = hash_file_blake3(src, cancel, false, buf)? else {
                     return Ok(SingleOutcome::Cancelled);
                 };
-                let Some(dst_h) = hash_file_blake3(dst, cancel, false)? else {
+                let Some(dst_h) = hash_file_blake3(dst, cancel, false, buf)? else {
                     return Ok(SingleOutcome::Cancelled);
                 };
                 src_h == dst_h
@@ -1184,7 +1230,6 @@ fn transfer_single_file(
         .open(&part_path)
         .with_context(|| format!("failed to create part file {}", part_path.display()))?;
 
-    let mut buf = vec![0u8; 2 * 1024 * 1024];
     let mut copied = 0u64;
     let mut src_hasher = if deep_verify {
         Some(blake3::Hasher::new())
@@ -1197,7 +1242,7 @@ fn transfer_single_file(
             drop(writer);
             return Ok(SingleOutcome::Cancelled);
         }
-        let n = match reader.read(&mut buf) {
+        let n = match reader.read(buf) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -1210,12 +1255,13 @@ fn transfer_single_file(
         copied += n as u64;
     }
 
-    // Flush data BEFORE set_modified so Windows/exFAT/SMB writeback does not clobber preserved mtime
-    writer.sync_all()?;
+    // Flush data BEFORE set_modified so Windows/exFAT/SMB writeback does not clobber preserved mtime,
+    // then issue a single full sync_all() durability barrier.
     if let Some(mtime) = src_mtime {
+        writer.sync_data()?;
         let _ = writer.set_modified(mtime);
-        let _ = writer.sync_all();
     }
+    writer.sync_all()?;
     drop(writer);
     drop(reader);
 
@@ -1227,7 +1273,7 @@ fn transfer_single_file(
     }
 
     if let Some(expected_hash) = src_hasher.map(|h| h.finalize()) {
-        let Some(actual_hash) = hash_file_blake3(&part_path, cancel, true)? else {
+        let Some(actual_hash) = hash_file_blake3(&part_path, cancel, true, buf)? else {
             return Ok(SingleOutcome::Cancelled);
         };
         if actual_hash != expected_hash {
@@ -1260,25 +1306,6 @@ fn transfer_single_file(
             "post-rename verification failed for {}",
             final_dst.display()
         ));
-    }
-
-    if is_move {
-        sync_parent_dir(&final_dst)?;
-        if is_same_file_path(src, &final_dst) {
-            return Err(anyhow!(
-                "refusing to delete source because source and destination resolve to the same file"
-            ));
-        }
-        if let Err(err) = std::fs::remove_file(src) {
-            return Ok(SingleOutcome::TransferredSourceKept {
-                dest: final_dst.clone(),
-                bytes: copied,
-                reason: format!(
-                    "File safely copied to {}, but source could not be removed (possibly camera-protected/locked): {err}",
-                    final_dst.display()
-                ),
-            });
-        }
     }
 
     Ok(SingleOutcome::Transferred(final_dst, copied))

@@ -31,7 +31,7 @@ export const Sidebar: React.FC = () => {
   const setActiveNav = useSyncStore((s) => s.setActiveNav);
   const volumes = useSyncStore((s) => s.volumes);
   const cloudProfiles = useSyncStore((s) => s.cloudProfiles);
-  const activeProgress = useSyncStore((s) => s.activeProgress);
+  const hasActiveJob = useSyncStore((s) => s.activeProgress !== null);
   const tools = useSyncStore((s) => s.tools);
 
   const sdCount = volumes.filter((v) => v.has_dcim).length;
@@ -85,7 +85,7 @@ export const Sidebar: React.FC = () => {
           </div>
           <div className="resource-row">
             <span>Queue</span>
-            <span>{activeProgress ? 'Running…' : 'Idle'}</span>
+            <span>{hasActiveJob ? 'Running…' : 'Idle'}</span>
           </div>
         </button>
 

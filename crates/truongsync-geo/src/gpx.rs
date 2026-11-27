@@ -73,7 +73,12 @@ pub fn parse_gpx_str(xml: &str) -> Result<Vec<TrackSegment>> {
     let mut in_pt = false;
     // Depth relative to `<trkpt>`/`<rtept>`: 0 = inside point, 1 = direct child (`<ele>`, `<time>`), >=2 = nested (`<extensions>`)
     let mut pt_child_depth: usize = 0;
-    let mut cur_tag: Option<String> = None;
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum PtTag {
+        Ele,
+        Time,
+    }
+    let mut cur_tag: Option<PtTag> = None;
     let mut text_acc = String::new();
 
     loop {
@@ -83,9 +88,14 @@ pub fn parse_gpx_str(xml: &str) -> Result<Vec<TrackSegment>> {
                 let name: &str = ln.as_ref();
                 if in_pt {
                     pt_child_depth += 1;
-                    if pt_child_depth == 1 && (name == "ele" || name == "time") {
-                        cur_tag = Some(name.to_string());
-                        text_acc.clear();
+                    if pt_child_depth == 1 {
+                        if name == "ele" {
+                            cur_tag = Some(PtTag::Ele);
+                            text_acc.clear();
+                        } else if name == "time" {
+                            cur_tag = Some(PtTag::Time);
+                            text_acc.clear();
+                        }
                     }
                 } else {
                     match name {
@@ -153,11 +163,11 @@ pub fn parse_gpx_str(xml: &str) -> Result<Vec<TrackSegment>> {
                         text_acc.clear();
                     } else {
                         if pt_child_depth == 1 {
-                            if let Some(ref tag) = cur_tag {
+                            if let Some(tag) = cur_tag {
                                 let trimmed = text_acc.trim();
-                                if tag == "ele" {
+                                if tag == PtTag::Ele {
                                     cur_ele = trimmed.parse::<f64>().ok().filter(|v| v.is_finite());
-                                } else if tag == "time" {
+                                } else if tag == PtTag::Time {
                                     if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed)
                                         .or_else(|_| {
                                             DateTime::parse_from_str(
@@ -206,11 +216,17 @@ pub fn parse_gpx_str(xml: &str) -> Result<Vec<TrackSegment>> {
 
 /// Parses and merges one or more `.gpx` files into a unified [`ParsedGpx`] structure.
 pub fn load_gpx_files(paths: &[String]) -> Result<ParsedGpx> {
-    let mut all_segments = Vec::new();
-    for p in paths {
-        let mut segs = parse_gpx_file(Path::new(p))?;
-        all_segments.append(&mut segs);
-    }
+    use rayon::prelude::*;
+
+    let parsed: Result<Vec<Vec<TrackSegment>>> = if paths.len() > 1 {
+        paths
+            .par_iter()
+            .map(|p| parse_gpx_file(Path::new(p)))
+            .collect()
+    } else {
+        paths.iter().map(|p| parse_gpx_file(Path::new(p))).collect()
+    };
+    let mut all_segments: Vec<TrackSegment> = parsed?.into_iter().flatten().collect();
     all_segments.sort_by_key(|s| s.points.first().map(|p| p.time_utc));
 
     let mut point_count = 0usize;

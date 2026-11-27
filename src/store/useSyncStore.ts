@@ -164,11 +164,20 @@ export const useSyncStore = create<SyncStore>((set, get) => ({
         ]).catch(() => {});
       }
 
-      const results = await Promise.allSettled([
+      // Fire slow OS probes (exiftool/rclone subprocesses & diskutil volume scan) concurrently
+      // WITHOUT blocking first paint on fast SQLite queries.
+      const toolsPromise = api
+        .checkTools()
+        .then((tools) => set({ tools }))
+        .catch(() => {});
+      const volumesPromise = api
+        .listVolumes()
+        .then((volumes) => set({ volumes }))
+        .catch(() => {});
+
+      const fastResults = await Promise.allSettled([
         api.getBootstrapInfo(),
-        api.checkTools(),
         api.getSettings(),
-        api.listVolumes(),
         api.listImportPresets(),
         api.listCloudProfiles(),
         api.listExternalProfiles(),
@@ -176,26 +185,26 @@ export const useSyncStore = create<SyncStore>((set, get) => ({
       ]);
 
       const initialVol =
-        results[0].status === 'fulfilled' ? results[0].value.initial_import_volume : null;
+        fastResults[0].status === 'fulfilled' ? fastResults[0].value.initial_import_volume : null;
       const patch: Partial<SyncStore> = { bootstrapped: true };
-      if (results[0].status === 'fulfilled') patch.bootstrap = results[0].value;
-      if (results[1].status === 'fulfilled') patch.tools = results[1].value;
-      if (results[2].status === 'fulfilled') patch.settings = results[2].value;
-      if (results[3].status === 'fulfilled') patch.volumes = results[3].value;
-      if (results[4].status === 'fulfilled') patch.presets = results[4].value;
-      if (results[5].status === 'fulfilled') patch.cloudProfiles = results[5].value;
-      if (results[6].status === 'fulfilled') patch.externalProfiles = results[6].value;
-      if (results[7].status === 'fulfilled') patch.jobs = results[7].value;
+      if (fastResults[0].status === 'fulfilled') patch.bootstrap = fastResults[0].value;
+      if (fastResults[1].status === 'fulfilled') patch.settings = fastResults[1].value;
+      if (fastResults[2].status === 'fulfilled') patch.presets = fastResults[2].value;
+      if (fastResults[3].status === 'fulfilled') patch.cloudProfiles = fastResults[3].value;
+      if (fastResults[4].status === 'fulfilled') patch.externalProfiles = fastResults[4].value;
+      if (fastResults[5].status === 'fulfilled') patch.jobs = fastResults[5].value;
 
       set((state) => ({
         ...patch,
         pendingAutoImportPath: state.pendingAutoImportPath ?? initialVol,
       }));
 
-      const firstFailure = results.find((r) => r.status === 'rejected');
+      const firstFailure = fastResults.find((r) => r.status === 'rejected');
       if (firstFailure && firstFailure.status === 'rejected') {
         notifyError(firstFailure.reason, 'Some startup data failed to load');
       }
+
+      await Promise.allSettled([toolsPromise, volumesPromise]);
     })().finally(() => {
       initInFlight = null;
     });

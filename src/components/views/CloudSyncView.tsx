@@ -37,6 +37,16 @@ const BLANK_PROFILE: CloudProfile = {
   stale_after_days: 7,
 };
 
+function cloudVerifyStamp(p: CloudProfile): string {
+  return JSON.stringify([
+    p.last_sync_at,
+    p.last_verify_at,
+    p.pending_upload_count,
+    p.pending_download_count,
+    p.pending_bytes,
+  ]);
+}
+
 export const CloudSyncView: React.FC = () => {
   const cloudProfiles = useSyncStore((s) => s.cloudProfiles);
   const tools = useSyncStore((s) => s.tools);
@@ -53,17 +63,17 @@ export const CloudSyncView: React.FC = () => {
   const [oauthBusy, setOauthBusy] = useState(false);
   const [busyMap, setBusyMap] = useState<Record<string, 'verify' | 'sync'>>({});
   const [verifyReports, setVerifyReports] = useState<Record<string, CloudVerifyReport>>({});
-  const [reportSyncStamps, setReportSyncStamps] = useState<Record<string, string | null>>({});
+  const [reportSyncStamps, setReportSyncStamps] = useState<Record<string, string>>({});
 
-  // Auto-invalidate stale verify reports whenever a profile finishes syncing in the background
-  // (scheduled sync, tray "Sync Google Drive Now", or Import Stage 3).
+  // Auto-invalidate stale verify reports whenever a profile completes a full/partial sync,
+  // restore, or background verify check.
   useEffect(() => {
     setVerifyReports((prev) => {
       let changed = false;
       const next = { ...prev };
       for (const id of Object.keys(prev)) {
         const p = cloudProfiles.find((c) => c.id === id);
-        if (!p || p.last_sync_at !== reportSyncStamps[id]) {
+        if (!p || cloudVerifyStamp(p) !== reportSyncStamps[id]) {
           delete next[id];
           changed = true;
         }
@@ -164,10 +174,12 @@ export const CloudSyncView: React.FC = () => {
     setProfileBusy(profileId, 'verify');
     try {
       const rep = await api.verifyCloud(profileId, deepMd5);
-      const syncStamp = cloudProfiles.find((c) => c.id === profileId)?.last_sync_at ?? null;
-      setReportSyncStamps((prev) => ({ ...prev, [profileId]: syncStamp }));
-      setVerifyReports((prev) => ({ ...prev, [profileId]: rep }));
       await refreshProfiles();
+      const freshProfile = useSyncStore.getState().cloudProfiles.find((c) => c.id === profileId);
+      if (freshProfile) {
+        setReportSyncStamps((prev) => ({ ...prev, [profileId]: cloudVerifyStamp(freshProfile) }));
+      }
+      setVerifyReports((prev) => ({ ...prev, [profileId]: rep }));
       notifySuccess(
         `Verified: ${rep.up_to_date_count.toLocaleString()} up to date, ↑${rep.missing_on_remote.length} upload, ↓${rep.missing_on_local.length} download.`,
       );

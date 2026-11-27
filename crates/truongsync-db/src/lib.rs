@@ -28,6 +28,10 @@ impl DbHandle {
         // Set busy_timeout BEFORE journal_mode=WAL so concurrent opens never fail immediately with SQLITE_BUSY.
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "cache_size", -16000)?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        let _ = conn.pragma_update(None, "mmap_size", 67_108_864i64);
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let handle = Self {
             conn: Arc::new(Mutex::new(conn)),

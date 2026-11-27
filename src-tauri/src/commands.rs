@@ -653,7 +653,11 @@ async fn run_locked_external_sync_background_inner(
             } else {
                 "external_sync"
             };
-            let title = format!("Scheduled Drive Backup: {}", profile.name);
+            let title = if restore_mode {
+                format!("Restore from External: {}", profile.name)
+            } else {
+                format!("Scheduled Drive Backup: {}", profile.name)
+            };
             let job_id = db.create_job(kind, &title, 0, 0).ok();
             let _exact_cancel = job_id.as_ref().and_then(|jid| {
                 app_clone
@@ -964,32 +968,54 @@ fn map_err(err: anyhow::Error) -> String {
 }
 
 #[tauri::command]
-pub fn get_bootstrap_info(app: AppHandle, state: State<'_, AppState>) -> BootstrapInfo {
+pub async fn get_bootstrap_info(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<BootstrapInfo, String> {
     state.bootstrapped.store(true, Ordering::SeqCst);
     // Take once so React StrictMode / reload never re-triggers initial auto-import forever
     let initial_vol = state.initial_import_volume.lock().take();
-    BootstrapInfo {
-        version: app.package_info().version.to_string(),
+    let version = app.package_info().version.to_string();
+    let data_dir = state.paths.data_dir.to_string_lossy().to_string();
+    let on_battery = tokio::task::spawn_blocking(is_on_battery)
+        .await
+        .unwrap_or(false);
+    Ok(BootstrapInfo {
+        version,
         platform: std::env::consts::OS.to_string(),
-        data_dir: state.paths.data_dir.to_string_lossy().to_string(),
-        on_battery: is_on_battery(),
+        data_dir,
+        on_battery,
         initial_import_volume: initial_vol,
-    }
+    })
 }
 
 #[tauri::command]
-pub fn check_tools(state: State<'_, AppState>) -> Result<ToolsStatus, String> {
+pub async fn check_tools(state: State<'_, AppState>) -> Result<ToolsStatus, String> {
     let settings = state.db.load_settings().map_err(map_err)?;
-    let exiftool = check_exiftool(settings.exiftool_path_override.as_deref());
-    let rclone = check_rclone(settings.rclone_path_override.as_deref());
-    let rclone_config_exists = state.paths.rclone_config_path.is_file();
-    let rclone_remotes = list_rclone_remotes(&state.paths.rclone_config_path);
-    Ok(ToolsStatus {
-        exiftool,
-        rclone,
-        rclone_config_exists,
-        rclone_remotes,
+    let rclone_conf = state.paths.rclone_config_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let (exiftool, rclone) = std::thread::scope(|s| {
+            let et_handle = s.spawn(|| check_exiftool(settings.exiftool_path_override.as_deref()));
+            let rclone = check_rclone(settings.rclone_path_override.as_deref());
+            let exiftool = et_handle.join().unwrap_or(ToolAvailability {
+                available: false,
+                bundled: false,
+                path: None,
+                version: None,
+            });
+            (exiftool, rclone)
+        });
+        let rclone_config_exists = rclone_conf.is_file();
+        let rclone_remotes = list_rclone_remotes(&rclone_conf);
+        ToolsStatus {
+            exiftool,
+            rclone,
+            rclone_config_exists,
+            rclone_remotes,
+        }
     })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1022,8 +1048,8 @@ pub fn save_settings(state: State<'_, AppState>, mut settings: AppSettings) -> R
     if !(1..=16).contains(&settings.import_threads) {
         return Err("Parallel import threads must be between 1 and 16.".into());
     }
-    if settings.stale_warning_days < 1 {
-        return Err("Freshness stale warning days must be at least 1.".into());
+    if !(1..=3650).contains(&settings.stale_warning_days) {
+        return Err("Freshness stale warning days must be between 1 and 3650.".into());
     }
     settings.watched_gpx_folder = settings
         .watched_gpx_folder
@@ -1365,11 +1391,14 @@ pub async fn run_import_pipeline(
                     speed_bps: 0,
                 },
             );
-            let dup_set: HashSet<String> = import_res
-                .skipped_duplicate_photo_paths
-                .iter()
-                .cloned()
-                .collect();
+            let dup_set: Arc<HashSet<String>> = Arc::new(
+                import_res
+                    .skipped_duplicate_photo_paths
+                    .iter()
+                    .cloned()
+                    .collect(),
+            );
+            let dup_set_md5 = Arc::clone(&dup_set);
             let db_hook = db.clone();
             match load_gpx_files(&req.gpx_files).and_then(|gpx| {
                 let gt_plan = build_geotag_plan(
@@ -1387,6 +1416,7 @@ pub async fn run_import_pipeline(
                     settings.exiftool_path_override.as_deref(),
                     settings.bump_mtime_on_backfill,
                     &cancel,
+                    move |path| dup_set_md5.contains(path),
                     move |done, total, name| {
                         let _ = app_g.emit(
                             "job-progress",
@@ -1679,7 +1709,9 @@ pub async fn run_import_pipeline(
                         ) {
                             Ok(e) => {
                                 external_synced += 1;
-                                if e.failed_count > 0 {
+                                if e.failed_count == 0 {
+                                    st.deferred_on_connect.lock().remove(pid);
+                                } else {
                                     stage_errors += e.failed_count;
                                 }
                                 notes.push(format!(
@@ -1891,6 +1923,7 @@ pub async fn run_geotag(
             settings.exiftool_path_override.as_deref(),
             settings.bump_mtime_on_backfill,
             &cancel,
+            move |_| record_backfill_updates,
             move |done, total, name| {
                 let _ = app_p.emit(
                     "job-progress",
@@ -1959,6 +1992,9 @@ pub async fn run_geotag(
     .await
     .map_err(|e| e.to_string())?;
 
+    // Release active write-roots BEFORE dropping overlapping profile locks so any queued
+    // follow-up sync spawned on `ProfileLockGuard::drop` never races a still-registered root.
+    drop(_write_roots_guard);
     if cancel_reg.token.is_cancelled() {
         for g in held_cloud_locks.values() {
             g.suppress_followup_on_cancel();
@@ -2143,7 +2179,7 @@ pub async fn sync_cloud_cmd(
         .ok_or_else(|| "Cloud profile not found".to_string())?;
     if state.overlaps_active_write_root(Path::new(profile.local_root.trim())) {
         return Err(
-            "Cannot verify this Google Drive profile while an active Import or Geotag job is modifying its folder."
+            "Cannot sync this Google Drive profile while an active Import or Geotag job is modifying its folder."
                 .into(),
         );
     }

@@ -316,12 +316,11 @@ pub fn check_exiftool(override_path: Option<&str>) -> ToolAvailability {
     }
 }
 
-pub fn compute_file_md5(path: &Path) -> Result<String> {
+pub fn compute_file_md5_with_buf(path: &Path, buf: &mut [u8]) -> Result<String> {
     let mut f = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mut hasher = Md5::new();
-    let mut buf = vec![0u8; 1024 * 1024];
     loop {
-        let n = match f.read(&mut buf) {
+        let n = match f.read(buf) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -332,8 +331,13 @@ pub fn compute_file_md5(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Writes matched GPS coordinates to RAW & JPEG photos in a single persistent
-/// `exiftool -config "" -stay_open True -@ - -common_args -charset filename=UTF8` session.
+pub fn compute_file_md5(path: &Path) -> Result<String> {
+    let mut buf = vec![0u8; 1024 * 1024];
+    compute_file_md5_with_buf(path, &mut buf)
+}
+
+/// Writes matched GPS coordinates to RAW & JPEG photos using persistent
+/// `exiftool -config "" -stay_open True -@ - -common_args -charset filename=UTF8` worker session(s).
 ///
 /// Safety guarantees:
 /// - `-config ""` isolates ExifTool from user/CWD `.ExifTool_config` files (no `-q`/`-lang`/arbitrary Perl)
@@ -343,7 +347,8 @@ pub fn compute_file_md5(path: &Path) -> Result<String> {
 /// - `-common_args -charset filename=UTF8` (+ `-api WindowsLongPath=1` on Windows) persisted across all files
 /// - Threaded stdout & stderr framing with live cancel polling + per-file timeout + Windows Job Object cleanup
 /// - ValueConv `-GPSAltitudeRef#={0|1}` so below-sea-level altitudes write accurately
-/// - Invokes `on_updated` immediately per file when `post_md5 != pre_md5` so backfill hashes survive crashes
+/// - When `needs_md5(path)` is true, computes pre/post MD5 with a reused per-worker buffer and invokes
+///   `on_updated` immediately per file when `post_md5 != pre_md5` so backfill hashes survive crashes
 pub fn write_geotags_batch<F>(
     items: &[PhotoGpsMatch],
     exiftool_override: Option<&str>,
@@ -352,81 +357,68 @@ pub fn write_geotags_batch<F>(
     on_progress: F,
 ) -> Result<GeotagExecutionResult>
 where
-    F: Fn(usize, usize, &str),
+    F: Fn(usize, usize, &str) + Sync,
 {
     write_geotags_batch_with_hook(
         items,
         exiftool_override,
         bump_mtime,
         cancel,
+        |_| true,
         on_progress,
         |_| {},
     )
 }
 
-pub fn write_geotags_batch_with_hook<F, U>(
-    items: &[PhotoGpsMatch],
-    exiftool_override: Option<&str>,
+struct WorkerOutcome {
+    tagged_count: usize,
+    skipped_count: usize,
+    was_cancelled: bool,
+    updated_records: Vec<GeotagWriteRecord>,
+    failures: Vec<(String, String)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_exiftool_worker<N, F, U>(
+    bin: &Path,
+    shard: &[&PhotoGpsMatch],
+    total: usize,
     bump_mtime: bool,
     cancel: &CancellationToken,
-    on_progress: F,
-    on_updated: U,
-) -> Result<GeotagExecutionResult>
+    done_counter: &std::sync::atomic::AtomicUsize,
+    last_emit: &std::sync::Mutex<Instant>,
+    needs_md5: &N,
+    on_progress: &F,
+    on_updated: &U,
+) -> Result<WorkerOutcome>
 where
-    F: Fn(usize, usize, &str),
-    U: Fn(&GeotagWriteRecord),
+    N: Fn(&str) -> bool + Sync,
+    F: Fn(usize, usize, &str) + Sync,
+    U: Fn(&GeotagWriteRecord) + Sync,
 {
     const PER_FILE_TIMEOUT: Duration = Duration::from_secs(120);
+    use std::sync::atomic::Ordering;
 
-    let bin = resolve_exiftool_binary(exiftool_override).ok_or_else(|| {
-        anyhow!("ExifTool was not found. Reinstall TruongSync or set ExifTool's path in Settings.")
-    })?;
-
-    let mut to_write: Vec<&PhotoGpsMatch> = Vec::new();
-    let mut skipped_count = 0usize;
-    let mut failures: Vec<(String, String)> = Vec::new();
-
-    for item in items {
-        if item.status != MatchStatus::Matched || item.media_kind.eq_ignore_ascii_case("video") {
-            skipped_count += 1;
-            continue;
-        }
-        let path = Path::new(&item.path);
-        if !is_safe_photo_target(path) {
-            // Hard refusal: never touch videos or non-photo files even if IPC payload claims otherwise
-            skipped_count += 1;
-            continue;
-        }
-        let (Some(lat), Some(lon)) = (item.lat, item.lon) else {
-            skipped_count += 1;
-            continue;
+    let emit_progress = |filename: &str| {
+        let done = done_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let should_emit = if done == total {
+            true
+        } else if let Ok(mut guard) = last_emit.try_lock() {
+            if guard.elapsed() >= Duration::from_millis(80) {
+                *guard = Instant::now();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         };
-        if !lat.is_finite()
-            || !lon.is_finite()
-            || !(-90.0..=90.0).contains(&lat)
-            || !(-180.0..=180.0).contains(&lon)
-        {
-            failures.push((
-                item.path.clone(),
-                format!("Invalid GPS coordinates ({lat}, {lon})"),
-            ));
-            continue;
+        if should_emit {
+            on_progress(done, total, filename);
         }
-        to_write.push(item);
-    }
+    };
 
-    if to_write.is_empty() {
-        return Ok(GeotagExecutionResult {
-            tagged_count: 0,
-            skipped_count,
-            failed_count: failures.len(),
-            cancelled: cancel.is_cancelled(),
-            updated_records: Vec::new(),
-            failures,
-        });
-    }
-
-    let mut cmd = new_exiftool_cmd(&bin);
+    let mut cmd = new_exiftool_cmd(bin);
     #[allow(unused_mut)]
     let mut spawn_args = vec![
         "-config",
@@ -464,7 +456,7 @@ where
         .take()
         .ok_or_else(|| anyhow!("failed to open ExifTool stderr"))?;
 
-    // Dedicated stdout reader thread so the main loop can poll with timeouts and live cancellation.
+    // Dedicated stdout reader thread so the worker can poll with timeouts and live cancellation.
     let (stdout_tx, stdout_rx) = mpsc::channel::<Result<String, String>>();
     let stdout_handle = std::thread::Builder::new()
         .name("ts-exiftool-stdout".into())
@@ -529,13 +521,16 @@ where
         })
         .ok();
 
-    let mut updated_records = Vec::with_capacity(to_write.len());
-    let total = to_write.len();
+    let mut md5_buf = vec![0u8; 1024 * 1024];
+    let mut updated_records = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+    let mut tagged_count = 0usize;
+    let mut skipped_count = 0usize;
     let mut protocol_broken = false;
     let mut was_cancelled = false;
-    let mut in_flight: Option<(String, PathBuf, String)> = None;
+    let mut in_flight: Option<(String, PathBuf, Option<String>)> = None;
 
-    for (idx, item) in to_write.iter().enumerate() {
+    for (idx, item) in shard.iter().enumerate() {
         if cancel.is_cancelled() {
             was_cancelled = true;
             break;
@@ -545,13 +540,13 @@ where
             Ok(p) => p,
             Err(e) => {
                 failures.push((item.path.clone(), format!("File unavailable: {e}")));
-                on_progress(idx + 1, total, &item.filename);
+                emit_progress(&item.filename);
                 continue;
             }
         };
         if !canon_path.is_file() || !is_safe_photo_target(&canon_path) {
             skipped_count += 1;
-            on_progress(idx + 1, total, &item.filename);
+            emit_progress(&item.filename);
             continue;
         }
         let safe_path_str = exiftool_safe_path_string(&canon_path);
@@ -560,21 +555,26 @@ where
                 item.path.clone(),
                 "Filename contains newline characters unsupported by ExifTool argfile".into(),
             ));
-            on_progress(idx + 1, total, &item.filename);
+            emit_progress(&item.filename);
             continue;
         }
 
         let (Some(lat), Some(lon)) = (item.lat, item.lon) else {
-            on_progress(idx + 1, total, &item.filename);
+            emit_progress(&item.filename);
             continue;
         };
-        let pre_md5 = match compute_file_md5(&canon_path) {
-            Ok(h) => h,
-            Err(e) => {
-                failures.push((item.path.clone(), e.to_string()));
-                on_progress(idx + 1, total, &item.filename);
-                continue;
+        let track_md5 = needs_md5(&item.path);
+        let pre_md5 = if track_md5 {
+            match compute_file_md5_with_buf(&canon_path, &mut md5_buf) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    failures.push((item.path.clone(), e.to_string()));
+                    emit_progress(&item.filename);
+                    continue;
+                }
             }
+        } else {
+            None
         };
 
         let seq = idx + 1;
@@ -634,7 +634,7 @@ where
                 item.path.clone(),
                 format!("ExifTool pipe write failed: {e}"),
             ));
-            for rem in &to_write[idx + 1..] {
+            for rem in &shard[idx + 1..] {
                 failures.push((
                     rem.path.clone(),
                     "Skipped after ExifTool process exited unexpectedly".into(),
@@ -714,20 +714,25 @@ where
 
         if combined.contains("1 image files updated") {
             in_flight = None;
-            match compute_file_md5(&canon_path) {
-                Ok(post_md5) if post_md5 != pre_md5 => {
-                    let rec = GeotagWriteRecord {
-                        path: item.path.clone(),
-                        pre_md5,
-                        post_md5,
-                    };
-                    on_updated(&rec);
-                    updated_records.push(rec);
+            if let Some(pre) = pre_md5 {
+                match compute_file_md5_with_buf(&canon_path, &mut md5_buf) {
+                    Ok(post_md5) if post_md5 != pre => {
+                        let rec = GeotagWriteRecord {
+                            path: item.path.clone(),
+                            pre_md5: pre,
+                            post_md5,
+                        };
+                        on_updated(&rec);
+                        updated_records.push(rec);
+                        tagged_count += 1;
+                    }
+                    Ok(_) => {
+                        skipped_count += 1;
+                    }
+                    Err(e) => failures.push((item.path.clone(), e.to_string())),
                 }
-                Ok(_) => {
-                    skipped_count += 1;
-                }
-                Err(e) => failures.push((item.path.clone(), e.to_string())),
+            } else {
+                tagged_count += 1;
             }
         } else if combined.contains("1 image files unchanged")
             || combined.contains("1 files failed condition")
@@ -754,14 +759,14 @@ where
             failures.push((item.path.clone(), detail));
         }
 
-        on_progress(idx + 1, total, &item.filename);
+        emit_progress(&item.filename);
 
         // If ExifTool did not emit `{ready{seq}}` (e.g. crashed/timed out after printing
-        // "1 image files updated"), abort the batch immediately rather than writing to a
+        // "1 image files updated"), abort this worker immediately rather than writing to a
         // dead or desynchronized process.
         if !reached_ready {
             protocol_broken = true;
-            for rem in &to_write[idx + 1..] {
+            for rem in &shard[idx + 1..] {
                 failures.push((
                     rem.path.clone(),
                     "Skipped after ExifTool process terminated early".into(),
@@ -806,20 +811,25 @@ where
 
     // After force-killing an in-flight write (cancel or timeout), clean up any orphaned
     // `_exiftool_tmp` sibling and reconcile MD5 so a photo already atomically replaced on disk
-    // right before termination never loses its `intentional_updates` backfill record.
-    if let Some((item_path, canon_path, pre_md5)) = in_flight {
+    // right before termination never loses its `intentional_updates` backfill record and is
+    // never double-counted as both tagged and failed.
+    if let Some((item_path, canon_path, maybe_pre_md5)) = in_flight {
         let mut tmp_os = canon_path.as_os_str().to_os_string();
         tmp_os.push("_exiftool_tmp");
         let _ = std::fs::remove_file(PathBuf::from(tmp_os));
-        if let Ok(post_md5) = compute_file_md5(&canon_path) {
-            if post_md5 != pre_md5 {
-                let rec = GeotagWriteRecord {
-                    path: item_path,
-                    pre_md5,
-                    post_md5,
-                };
-                on_updated(&rec);
-                updated_records.push(rec);
+        if let Some(pre_md5) = maybe_pre_md5 {
+            if let Ok(post_md5) = compute_file_md5_with_buf(&canon_path, &mut md5_buf) {
+                if post_md5 != pre_md5 {
+                    failures.retain(|(p, _)| p != &item_path);
+                    let rec = GeotagWriteRecord {
+                        path: item_path,
+                        pre_md5,
+                        post_md5,
+                    };
+                    on_updated(&rec);
+                    updated_records.push(rec);
+                    tagged_count += 1;
+                }
             }
         }
     }
@@ -834,8 +844,171 @@ where
         }
     }
 
+    Ok(WorkerOutcome {
+        tagged_count,
+        skipped_count,
+        was_cancelled,
+        updated_records,
+        failures,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn write_geotags_batch_with_hook<N, F, U>(
+    items: &[PhotoGpsMatch],
+    exiftool_override: Option<&str>,
+    bump_mtime: bool,
+    cancel: &CancellationToken,
+    needs_md5: N,
+    on_progress: F,
+    on_updated: U,
+) -> Result<GeotagExecutionResult>
+where
+    N: Fn(&str) -> bool + Sync,
+    F: Fn(usize, usize, &str) + Sync,
+    U: Fn(&GeotagWriteRecord) + Sync,
+{
+    let bin = resolve_exiftool_binary(exiftool_override).ok_or_else(|| {
+        anyhow!("ExifTool was not found. Reinstall TruongSync or set ExifTool's path in Settings.")
+    })?;
+
+    let mut to_write: Vec<&PhotoGpsMatch> = Vec::new();
+    let mut skipped_count = 0usize;
+    let mut failures: Vec<(String, String)> = Vec::new();
+
+    for item in items {
+        if item.status != MatchStatus::Matched || item.media_kind.eq_ignore_ascii_case("video") {
+            skipped_count += 1;
+            continue;
+        }
+        let path = Path::new(&item.path);
+        if !is_safe_photo_target(path) {
+            // Hard refusal: never touch videos or non-photo files even if IPC payload claims otherwise
+            skipped_count += 1;
+            continue;
+        }
+        let (Some(lat), Some(lon)) = (item.lat, item.lon) else {
+            skipped_count += 1;
+            continue;
+        };
+        if !lat.is_finite()
+            || !lon.is_finite()
+            || !(-90.0..=90.0).contains(&lat)
+            || !(-180.0..=180.0).contains(&lon)
+        {
+            failures.push((
+                item.path.clone(),
+                format!("Invalid GPS coordinates ({lat}, {lon})"),
+            ));
+            continue;
+        }
+        to_write.push(item);
+    }
+
+    if to_write.is_empty() {
+        return Ok(GeotagExecutionResult {
+            tagged_count: 0,
+            skipped_count,
+            failed_count: failures.len(),
+            cancelled: cancel.is_cancelled(),
+            updated_records: Vec::new(),
+            failures,
+        });
+    }
+
+    let total = to_write.len();
+    let worker_count = if total >= 8 {
+        (std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            / 2)
+        .clamp(2, 4)
+    } else {
+        1
+    };
+
+    let done_counter = std::sync::atomic::AtomicUsize::new(0);
+    let last_emit = std::sync::Mutex::new(Instant::now() - Duration::from_secs(1));
+
+    let mut shards: Vec<Vec<&PhotoGpsMatch>> = (0..worker_count).map(|_| Vec::new()).collect();
+    for (idx, item) in to_write.into_iter().enumerate() {
+        shards[idx % worker_count].push(item);
+    }
+
+    let worker_results: Vec<Result<WorkerOutcome>> = if worker_count == 1 {
+        vec![run_exiftool_worker(
+            &bin,
+            &shards[0],
+            total,
+            bump_mtime,
+            cancel,
+            &done_counter,
+            &last_emit,
+            &needs_md5,
+            &on_progress,
+            &on_updated,
+        )]
+    } else {
+        std::thread::scope(|s| {
+            let handles: Vec<_> = shards
+                .iter()
+                .filter(|sh| !sh.is_empty())
+                .map(|sh| {
+                    let bin_ref = &bin;
+                    let done_ref = &done_counter;
+                    let emit_ref = &last_emit;
+                    let needs_ref = &needs_md5;
+                    let prog_ref = &on_progress;
+                    let upd_ref = &on_updated;
+                    s.spawn(move || {
+                        run_exiftool_worker(
+                            bin_ref, sh, total, bump_mtime, cancel, done_ref, emit_ref, needs_ref,
+                            prog_ref, upd_ref,
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(anyhow!("ExifTool worker thread panicked")))
+                })
+                .collect()
+        })
+    };
+
+    let mut tagged_count = 0usize;
+    let mut was_cancelled = false;
+    let mut updated_records = Vec::new();
+    let mut first_spawn_err: Option<anyhow::Error> = None;
+
+    for res in worker_results {
+        match res {
+            Ok(out) => {
+                tagged_count += out.tagged_count;
+                skipped_count += out.skipped_count;
+                was_cancelled |= out.was_cancelled;
+                updated_records.extend(out.updated_records);
+                failures.extend(out.failures);
+            }
+            Err(err) => {
+                if first_spawn_err.is_none() {
+                    first_spawn_err = Some(err);
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_spawn_err {
+        if tagged_count == 0 && skipped_count == 0 && failures.is_empty() {
+            return Err(err);
+        }
+        failures.push((String::new(), err.to_string()));
+    }
+
     Ok(GeotagExecutionResult {
-        tagged_count: updated_records.len(),
+        tagged_count,
         skipped_count,
         failed_count: failures.len(),
         cancelled: was_cancelled || cancel.is_cancelled(),

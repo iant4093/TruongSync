@@ -4,8 +4,11 @@ import { api, pickDirectory, pickFiles } from '../../lib/tauri';
 import { confirmAction, notifyError, notifyInfo, notifySuccess } from '../../store/feedback';
 import { useSyncStore } from '../../store/useSyncStore';
 import type { GeotagExecutionResult, GeotagPlan, WatchedGpxMatch } from '../../types/api';
-import { GpxMapPreview } from '../GpxMapPreview';
 import { Badge, EmptyState, SectionTitle, SegmentedControl, ToggleRow, ViewHeader } from '../ui';
+
+const GpxMapPreview = React.lazy(() =>
+  import('../GpxMapPreview').then((m) => ({ default: m.GpxMapPreview })),
+);
 
 export const GeotagView: React.FC = () => {
   const settings = useSyncStore((s) => s.settings);
@@ -146,10 +149,14 @@ export const GeotagView: React.FC = () => {
     }
   };
 
-  const visibleItems = (plan?.items ?? []).filter((item) => {
-    if (filter === 'all') return true;
-    return item.status === filter;
-  });
+  const visibleItems = useMemo(
+    () =>
+      (plan?.items ?? []).filter((item) => {
+        if (filter === 'all') return true;
+        return item.status === filter;
+      }),
+    [plan?.items, filter],
+  );
 
   return (
     <div className="view-content">
@@ -286,6 +293,11 @@ export const GeotagView: React.FC = () => {
                   setMaxGapText(e.target.value);
                 }}
               />
+              {!maxGapValid && (
+                <span style={{ color: 'var(--danger-text)', fontSize: 11, marginTop: 3 }}>
+                  Enter a whole number between 1 and 1440 minutes.
+                </span>
+              )}
             </div>
           </div>
 
@@ -353,7 +365,15 @@ export const GeotagView: React.FC = () => {
               </span>
             </div>
           )}
-          <GpxMapPreview plan={plan} />
+          <React.Suspense
+            fallback={
+              <div className="card">
+                <div className="card-body muted">Loading interactive GPX map preview…</div>
+              </div>
+            }
+          >
+            <GpxMapPreview plan={plan} />
+          </React.Suspense>
 
           <div className="row-between" style={{ marginTop: 16, marginBottom: 10 }}>
             <SegmentedControl
@@ -369,7 +389,7 @@ export const GeotagView: React.FC = () => {
             <button
               type="button"
               className="button button-primary"
-              disabled={writing || isPlanStale || plan.matched_count === 0 || !tools?.exiftool.available}
+              disabled={writing || isPlanStale || !maxGapValid || plan.matched_count === 0 || !tools?.exiftool.available}
               onClick={() => void handleWrite()}
             >
               <MapPin size={14} />

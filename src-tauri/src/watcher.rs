@@ -230,12 +230,7 @@ pub fn start_background_scheduler(app: AppHandle) {
                 let settings = state.db.load_settings().unwrap_or_default();
                 let cloud = state.db.list_cloud_profiles().unwrap_or_default();
                 let ext = state.db.list_external_profiles().unwrap_or_default();
-                let mounted_vols = if ext.iter().any(|p| p.enabled && p.schedule_mode != "manual") {
-                    truongsync_ingest::volumes::list_mounted_volumes()
-                } else {
-                    Vec::new()
-                };
-                (on_batt, Some((settings, cloud, ext, mounted_vols)))
+                (on_batt, Some((settings, cloud, ext)))
             })
             .await
             .unwrap_or((false, None));
@@ -246,7 +241,7 @@ pub fn start_background_scheduler(app: AppHandle) {
                 let _ = app.emit("battery-changed", on_batt);
             }
 
-            if let Some((settings, cloud_profiles, ext_profiles, mounted_vols)) = maybe_data {
+            if let Some((settings, cloud_profiles, ext_profiles)) = maybe_data {
                 let battery_blocked = !settings.sync_on_battery && on_batt;
 
                 if !battery_blocked {
@@ -314,78 +309,95 @@ pub fn start_background_scheduler(app: AppHandle) {
                         }
                     }
 
-                    for p in ext_profiles.into_iter().filter(|p| p.enabled) {
-                        let key = format!("external:{}", p.id);
-                        let connected = mounted_vols
-                            .iter()
-                            .any(|v| external_profile_matches_volume(&p, v));
-                        let was_deferred = app
-                            .try_state::<AppState>()
-                            .is_some_and(|st| st.deferred_on_connect.lock().contains(&p.id));
-                        if was_deferred && !connected {
-                            if let Some(st) = app.try_state::<AppState>() {
-                                st.deferred_on_connect.lock().remove(&p.id);
-                            }
-                            continue;
-                        }
-                        if app
-                            .try_state::<AppState>()
-                            .is_some_and(|st| st.is_external_locked(&p.id))
-                        {
-                            continue;
-                        }
-                        if recently_attempted(&last_failure.lock(), &key, 15) {
-                            continue;
-                        }
-                        let latest_ref = latest_timestamp(
-                            p.last_sync_at.as_deref(),
-                            p.last_verify_at.as_deref(),
-                            p.schedule_action == "check",
-                        );
-                        let daily_mem = last_daily_key.lock().get(&key).cloned();
-                        let due = match p.schedule_mode.as_str() {
-                            "on_connect" => was_deferred,
-                            "interval" => {
-                                let hours: i64 =
-                                    p.schedule_value.trim().parse().unwrap_or(12).max(1);
-                                is_interval_due(latest_ref, now_utc, hours)
-                            }
-                            "daily" => is_daily_due(
-                                &p.schedule_value,
-                                now_local,
-                                daily_mem.as_deref(),
-                                latest_ref,
-                                &today_str,
-                            ),
-                            _ => false,
-                        };
-                        if due && connected {
-                            let app_c = app.clone();
-                            let pid = p.id.clone();
-                            let do_sync = p.schedule_action == "sync";
-                            let mode = p.schedule_mode.clone();
-                            let d_done = Arc::clone(&last_daily_key);
-                            let fail_map = Arc::clone(&last_failure);
-                            let today_c = today_str.clone();
-                            tauri::async_runtime::spawn(async move {
-                                let ok = run_locked_external_sync_background(
-                                    &app_c, &pid, do_sync, false,
-                                )
-                                .await;
-                                if ok {
-                                    fail_map.lock().remove(&key);
-                                    if was_deferred {
-                                        if let Some(st) = app_c.try_state::<AppState>() {
-                                            st.deferred_on_connect.lock().remove(&pid);
-                                        }
+                    // Determine which enabled external profiles are actually due or deferred BEFORE
+                    // polling OS volumes so idle 60-second scheduler ticks never spawn `diskutil`.
+                    let ext_candidates: Vec<_> = ext_profiles
+                        .into_iter()
+                        .filter(|p| p.enabled)
+                        .filter_map(|p| {
+                            let key = format!("external:{}", p.id);
+                            let was_deferred = app
+                                .try_state::<AppState>()
+                                .is_some_and(|st| st.deferred_on_connect.lock().contains(&p.id));
+                            let locked = app
+                                .try_state::<AppState>()
+                                .is_some_and(|st| st.is_external_locked(&p.id));
+                            let cooled = recently_attempted(&last_failure.lock(), &key, 15);
+                            let latest_ref = latest_timestamp(
+                                p.last_sync_at.as_deref(),
+                                p.last_verify_at.as_deref(),
+                                p.schedule_action == "check",
+                            );
+                            let daily_mem = last_daily_key.lock().get(&key).cloned();
+                            let due = !locked
+                                && !cooled
+                                && match p.schedule_mode.as_str() {
+                                    "on_connect" => was_deferred,
+                                    "interval" => {
+                                        let hours: i64 =
+                                            p.schedule_value.trim().parse().unwrap_or(12).max(1);
+                                        is_interval_due(latest_ref, now_utc, hours)
                                     }
-                                    if mode == "daily" {
-                                        d_done.lock().insert(key, today_c);
-                                    }
-                                } else {
-                                    fail_map.lock().insert(key, Instant::now());
+                                    "daily" => is_daily_due(
+                                        &p.schedule_value,
+                                        now_local,
+                                        daily_mem.as_deref(),
+                                        latest_ref,
+                                        &today_str,
+                                    ),
+                                    _ => false,
+                                };
+                            if due || was_deferred {
+                                Some((p, key, was_deferred, due))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    if !ext_candidates.is_empty() {
+                        let mounted_vols = tokio::task::spawn_blocking(list_mounted_volumes)
+                            .await
+                            .unwrap_or_default();
+
+                        for (p, key, was_deferred, due) in ext_candidates {
+                            let connected = mounted_vols
+                                .iter()
+                                .any(|v| external_profile_matches_volume(&p, v));
+                            if was_deferred && !connected {
+                                if let Some(st) = app.try_state::<AppState>() {
+                                    st.deferred_on_connect.lock().remove(&p.id);
                                 }
-                            });
+                                continue;
+                            }
+                            if due && connected {
+                                let app_c = app.clone();
+                                let pid = p.id.clone();
+                                let do_sync = p.schedule_action == "sync";
+                                let mode = p.schedule_mode.clone();
+                                let d_done = Arc::clone(&last_daily_key);
+                                let fail_map = Arc::clone(&last_failure);
+                                let today_c = today_str.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    let ok = run_locked_external_sync_background(
+                                        &app_c, &pid, do_sync, false,
+                                    )
+                                    .await;
+                                    if ok {
+                                        fail_map.lock().remove(&key);
+                                        if was_deferred {
+                                            if let Some(st) = app_c.try_state::<AppState>() {
+                                                st.deferred_on_connect.lock().remove(&pid);
+                                            }
+                                        }
+                                        if mode == "daily" {
+                                            d_done.lock().insert(key, today_c);
+                                        }
+                                    } else {
+                                        fail_map.lock().insert(key, Instant::now());
+                                    }
+                                });
+                            }
                         }
                     }
                 }

@@ -110,8 +110,8 @@ export const SettingsView: React.FC = () => {
     }
 
     const staleDays = Number(staleDaysText.trim());
-    if (!Number.isInteger(staleDays) || staleDays < 1) {
-      notifyError('Freshness stale warning days must be a whole number of at least 1.');
+    if (!Number.isInteger(staleDays) || staleDays < 1 || staleDays > 3650) {
+      notifyError('Freshness stale warning days must be a whole number between 1 and 3650.');
       return;
     }
 
@@ -364,6 +364,7 @@ export const SettingsView: React.FC = () => {
                 type="number"
                 className="text-input"
                 min={1}
+                max={3650}
                 value={staleDaysText}
                 onChange={(e) => {
                   dirtyRef.current = true;

@@ -26,28 +26,33 @@ const NAV_TITLES: Record<NavTab, string> = {
   settings: 'Settings',
 };
 
+const MemoImportView = React.memo(ImportView);
+const MemoGeotagView = React.memo(GeotagView);
+const MemoCloudSyncView = React.memo(CloudSyncView);
+const MemoDriveBackupView = React.memo(DriveBackupView);
+const MemoActivityView = React.memo(ActivityView);
+const MemoSettingsView = React.memo(SettingsView);
+
+const HeaderProgressBadge: React.FC = () => {
+  const message = useSyncStore((s) => s.activeProgress?.message ?? null);
+  if (!message) return null;
+  return <Badge tone="info">{message}</Badge>;
+};
+
 export const App: React.FC = () => {
   const activeNav = useSyncStore((s) => s.activeNav);
-  const bootstrap = useSyncStore((s) => s.bootstrap);
-  const activeProgress = useSyncStore((s) => s.activeProgress);
-  const inspectorJobId = useSyncStore((s) => s.inspectorJobId);
-  const jobs = useSyncStore((s) => s.jobs);
-  const init = useSyncStore((s) => s.init);
-  const inspectorOpen = Boolean(
-    activeNav === 'activity' && inspectorJobId && jobs.some((j) => j.id === inspectorJobId),
+  const onBattery = useSyncStore((s) => Boolean(s.bootstrap?.on_battery));
+  const inspectorOpen = useSyncStore((s) =>
+    Boolean(s.activeNav === 'activity' && s.inspectorJobId && s.jobs.some((j) => j.id === s.inspectorJobId)),
   );
+  const init = useSyncStore((s) => s.init);
   const viewportRef = useRef<HTMLDivElement>(null);
   const scrollByTabRef = useRef<Partial<Record<NavTab, number>>>({});
-  const prevTabRef = useRef<NavTab>(activeNav);
 
   useLayoutEffect(() => {
     const vp = viewportRef.current;
     if (!vp) return;
-    if (prevTabRef.current !== activeNav) {
-      scrollByTabRef.current[prevTabRef.current] = vp.scrollTop;
-      prevTabRef.current = activeNav;
-      vp.scrollTop = scrollByTabRef.current[activeNav] ?? 0;
-    }
+    vp.scrollTop = scrollByTabRef.current[activeNav] ?? 0;
   }, [activeNav]);
 
   useEffect(() => {
@@ -78,8 +83,8 @@ export const App: React.FC = () => {
             {NAV_TITLES[activeNav]}
           </span>
           <div className="workspace-controls">
-            {activeProgress && <Badge tone="info">{activeProgress.message}</Badge>}
-            {bootstrap?.on_battery && (
+            <HeaderProgressBadge />
+            {onBattery && (
               <Badge tone="warn">
                 <BatteryCharging size={12} /> Battery
               </Badge>
@@ -89,24 +94,30 @@ export const App: React.FC = () => {
         </header>
 
         <div className={`workspace-body ${inspectorOpen ? 'with-inspector' : ''}`}>
-          <div className="content-viewport" ref={viewportRef}>
+          <div
+            className="content-viewport"
+            ref={viewportRef}
+            onScroll={(e) => {
+              scrollByTabRef.current[activeNav] = e.currentTarget.scrollTop;
+            }}
+          >
             <div style={{ display: activeNav === 'import' ? undefined : 'none' }}>
-              <ImportView />
+              <MemoImportView />
             </div>
             <div style={{ display: activeNav === 'geotag' ? undefined : 'none' }}>
-              <GeotagView />
+              <MemoGeotagView />
             </div>
             <div style={{ display: activeNav === 'cloud' ? undefined : 'none' }}>
-              <CloudSyncView />
+              <MemoCloudSyncView />
             </div>
             <div style={{ display: activeNav === 'backup' ? undefined : 'none' }}>
-              <DriveBackupView />
+              <MemoDriveBackupView />
             </div>
             <div style={{ display: activeNav === 'activity' ? undefined : 'none' }}>
-              <ActivityView />
+              <MemoActivityView />
             </div>
             <div style={{ display: activeNav === 'settings' ? undefined : 'none' }}>
-              <SettingsView />
+              <MemoSettingsView />
             </div>
           </div>
           <JobInspectorDrawer />

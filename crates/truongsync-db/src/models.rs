@@ -5,6 +5,12 @@ use unicode_normalization::UnicodeNormalization;
 /// Normalizes a relative path into OS-agnostic forward-slash NFC form so macOS and Windows
 /// share identical keys in `sync_manifest` and verification diffs.
 pub fn normalize_rel_path(path: &str) -> String {
+    if path.is_ascii() {
+        if !path.contains('\\') {
+            return path.trim_start_matches('/').to_string();
+        }
+        return path.replace('\\', "/").trim_start_matches('/').to_string();
+    }
     path.replace('\\', "/")
         .trim_start_matches('/')
         .nfc()

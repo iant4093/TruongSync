@@ -18,6 +18,7 @@ import { useSyncStore } from '../../store/useSyncStore';
 import type {
   CardScanResult,
   ImportPlanItem,
+  ImportPreset,
   PipelineSummary,
   PreflightReport,
   ShootAssignment,
@@ -104,11 +105,12 @@ export const ImportView: React.FC = () => {
   const settings = useSyncStore((s) => s.settings);
   const cloudProfiles = useSyncStore((s) => s.cloudProfiles);
   const externalProfiles = useSyncStore((s) => s.externalProfiles);
-  const activeJobs = useSyncStore((s) => s.activeJobs);
-  const importProgress =
-    Object.values(activeJobs).find(
-      (j) => j.job_kind === 'pipeline' || (!j.job_kind && j.stage === 'import'),
-    ) ?? null;
+  const importProgress = useSyncStore(
+    (s) =>
+      Object.values(s.activeJobs).find(
+        (j) => j.job_kind === 'pipeline' || (!j.job_kind && j.stage === 'import'),
+      ) ?? null,
+  );
   const pendingAutoImportPath = useSyncStore((s) => s.pendingAutoImportPath);
   const setPendingAutoImportPath = useSyncStore((s) => s.setPendingAutoImportPath);
   const refreshVolumes = useSyncStore((s) => s.refreshVolumes);
@@ -116,7 +118,7 @@ export const ImportView: React.FC = () => {
   const refreshSettings = useSyncStore((s) => s.refreshSettings);
 
   const hydratedPresetIdRef = useRef<string | null>(null);
-  const hydratedPresetSigRef = useRef<string | null>(null);
+  const prevPresetRef = useRef<ImportPreset | null>(null);
   const scanSeqRef = useRef(0);
 
   const defaultPreset = presets[0];
@@ -167,37 +169,20 @@ export const ImportView: React.FC = () => {
   const [running, setRunning] = useState(false);
   const [lastSummary, setLastSummary] = useState<PipelineSummary | null>(null);
 
-  // Hydrate form fields when preset selection changes OR when the selected preset's saved
-  // defaults actually change (e.g. edited in SettingsView), while never clobbering user edits
-  // on unrelated background profile refreshes.
+  // Hydrate form fields when preset selection changes OR apply per-field diffs when the
+  // selected preset's saved defaults change (e.g. edited in SettingsView), without clobbering
+  // unrelated in-form user overrides like Copy vs Move or Geotag toggles.
   useEffect(() => {
     const p = presets.find((x) => x.id === selectedPresetId) ?? presets[0];
     if (!p) return;
     if (!selectedPresetId) setSelectedPresetId(p.id);
-    const sig = JSON.stringify([
-      p.id,
-      p.root_path,
-      p.folder_template,
-      p.date_format,
-      p.raw_folder,
-      p.jpeg_folder,
-      p.video_folder,
-      p.transfer_mode,
-      p.auto_geotag,
-      p.auto_cloud_sync,
-      p.auto_external_sync,
-      p.eject_after,
-    ]);
     const presetSwitched = hydratedPresetIdRef.current !== p.id;
-    const presetDefaultsUpdated = !presetSwitched && hydratedPresetSigRef.current !== sig && !running;
-    if (presetSwitched || presetDefaultsUpdated) {
+    const prev = prevPresetRef.current;
+
+    if (presetSwitched) {
       hydratedPresetIdRef.current = p.id;
-      hydratedPresetSigRef.current = sig;
-      setDestRoot((prev) =>
-        presetDefaultsUpdated
-          ? p.root_path || settings?.default_import_root || prev
-          : prev || p.root_path || settings?.default_import_root || '',
-      );
+      prevPresetRef.current = p;
+      setDestRoot((cur) => cur || p.root_path || settings?.default_import_root || '');
       setFolderTemplate(p.folder_template);
       setDateFormat(p.date_format);
       setRawFolder(p.raw_folder);
@@ -206,18 +191,33 @@ export const ImportView: React.FC = () => {
       setTransferMode(p.transfer_mode === 'copy' ? 'copy' : 'move');
       setGeotagEnabled(p.auto_geotag);
       setEjectAfter(p.eject_after);
-      if (presetSwitched) {
-        if (p.auto_cloud_sync) {
-          setSelectedCloudIds(cloudProfiles.filter((c) => c.enabled).map((c) => c.id));
-        }
-        if (p.auto_external_sync) {
-          setSelectedExternalIds(externalProfiles.filter((e) => e.enabled).map((e) => e.id));
-        }
+      if (p.auto_cloud_sync) {
+        setSelectedCloudIds(cloudProfiles.filter((c) => c.enabled).map((c) => c.id));
       }
+      if (p.auto_external_sync) {
+        setSelectedExternalIds(externalProfiles.filter((e) => e.enabled).map((e) => e.id));
+      }
+    } else if (prev && !running) {
+      prevPresetRef.current = p;
+      if (prev.root_path !== p.root_path) {
+        setDestRoot((cur) => p.root_path || settings?.default_import_root || cur);
+      } else if (!destRoot && (p.root_path || settings?.default_import_root)) {
+        setDestRoot(p.root_path || settings?.default_import_root || '');
+      }
+      if (prev.folder_template !== p.folder_template) setFolderTemplate(p.folder_template);
+      if (prev.date_format !== p.date_format) setDateFormat(p.date_format);
+      if (prev.raw_folder !== p.raw_folder) setRawFolder(p.raw_folder);
+      if (prev.jpeg_folder !== p.jpeg_folder) setJpegFolder(p.jpeg_folder);
+      if (prev.video_folder !== p.video_folder) setVideoFolder(p.video_folder);
+      if (prev.transfer_mode !== p.transfer_mode) {
+        setTransferMode(p.transfer_mode === 'copy' ? 'copy' : 'move');
+      }
+      if (prev.auto_geotag !== p.auto_geotag) setGeotagEnabled(p.auto_geotag);
+      if (prev.eject_after !== p.eject_after) setEjectAfter(p.eject_after);
     } else if (!destRoot && (p.root_path || settings?.default_import_root)) {
       setDestRoot(p.root_path || settings?.default_import_root || '');
     }
-  }, [presets, selectedPresetId, settings?.default_import_root]);
+  }, [presets, selectedPresetId, settings?.default_import_root, running]);
 
   // Prune deleted cloud/external profile IDs without overriding user selections or transferMode
   useEffect(() => {
@@ -239,33 +239,40 @@ export const ImportView: React.FC = () => {
     }
   }, [pendingAutoImportPath]);
 
-  // Load dynamic year categories whenever destRoot or folderDate changes (debounced)
+  // Load dynamic year categories whenever destRoot, folderDate, or default_categories changes
   useEffect(() => {
-    if (!destRoot.trim()) return;
+    const applyCategories = (cats: string[]) => {
+      if (cats.length === 0) return;
+      setCategories(cats);
+      setCategory((prev) => (cats.includes(prev) ? prev : cats[0]));
+      setDateAssignments((prev) => {
+        let changed = false;
+        const next: typeof prev = {};
+        for (const [k, row] of Object.entries(prev)) {
+          if (!cats.includes(row.category)) {
+            changed = true;
+            next[k] = { ...row, category: cats[0] };
+          } else {
+            next[k] = row;
+          }
+        }
+        return changed ? next : prev;
+      });
+    };
+
+    if (!destRoot.trim()) {
+      if (settings?.default_categories && settings.default_categories.length > 0) {
+        applyCategories(settings.default_categories);
+      }
+      return;
+    }
     let cancelled = false;
     const year = Number(folderDate.slice(0, 4)) || new Date().getFullYear();
     const timer = window.setTimeout(() => {
       void api
         .listYearCategories(destRoot, year, false)
         .then((cats) => {
-          if (cancelled) return;
-          if (cats.length > 0) {
-            setCategories(cats);
-            setCategory((prev) => (cats.includes(prev) ? prev : cats[0]));
-            setDateAssignments((prev) => {
-              let changed = false;
-              const next: typeof prev = {};
-              for (const [k, row] of Object.entries(prev)) {
-                if (!cats.includes(row.category)) {
-                  changed = true;
-                  next[k] = { ...row, category: cats[0] };
-                } else {
-                  next[k] = row;
-                }
-              }
-              return changed ? next : prev;
-            });
-          }
+          if (!cancelled) applyCategories(cats);
         })
         .catch(() => {});
     }, 250);
@@ -273,7 +280,7 @@ export const ImportView: React.FC = () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [destRoot, folderDate]);
+  }, [destRoot, folderDate, settings?.default_categories]);
 
   // Re-run preflight automatically when scan, destRoot, or transferMode changes (debounced)
   useEffect(() => {

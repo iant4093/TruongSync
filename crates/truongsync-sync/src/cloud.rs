@@ -1,10 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use parking_lot::Mutex;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
@@ -13,7 +16,7 @@ use truongsync_db::models::{
     IntentionalUpdate, ManifestEntry,
 };
 use truongsync_db::DbHandle;
-use truongsync_geo::exiftool::{compute_file_md5, ToolAvailability};
+use truongsync_geo::exiftool::{compute_file_md5, compute_file_md5_with_buf, ToolAvailability};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +235,7 @@ fn run_rclone_cancellable_with_timeout(
     });
 
     let started = Instant::now();
+    let mut poll_ms = 5u64;
     let status = loop {
         if cancel.is_cancelled() {
             let _ = child.kill();
@@ -251,7 +255,14 @@ fn run_rclone_cancellable_with_timeout(
         }
         match child.try_wait()? {
             Some(st) => break st,
-            None => std::thread::sleep(Duration::from_millis(150)),
+            None => {
+                std::thread::sleep(Duration::from_millis(poll_ms));
+                poll_ms = match poll_ms {
+                    5 => 15,
+                    15 => 50,
+                    _ => 150,
+                };
+            }
         }
     };
 
@@ -559,7 +570,15 @@ fn scan_local_tree(
         }
         return Ok((map, exact_collisions, 0));
     }
-    for entry_res in WalkDir::new(root).follow_links(false) {
+    for entry_res in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            e.depth() == 0
+                || !e.file_type().is_dir()
+                || !is_mac_metadata_path(&e.file_name().to_string_lossy())
+        })
+    {
         if cancel.is_cancelled() {
             return Err(anyhow!("Sync cancelled."));
         }
@@ -625,6 +644,8 @@ fn list_remote_tree(
         "lsjson",
         "--recursive",
         "--files-only",
+        "--fast-list",
+        "--no-modtime",
         "--hash-type",
         "MD5",
         "--no-mimetype",
@@ -791,11 +812,17 @@ fn verify_cloud_inner(
             profile.local_root
         ));
     }
-    let (local_map, local_exact_dups, local_mac) =
-        scan_local_tree(local_root, !restore_mode, cancel)?;
     let remote = remote_spec(profile)?;
-    let (remote_map, duplicate_remote_paths, remote_mac, remote_root_exists) =
-        list_remote_tree(&bin, managed_conf, &remote, cancel)?;
+    let (local_res, remote_res) = std::thread::scope(|s| {
+        let local_handle = s.spawn(|| scan_local_tree(local_root, !restore_mode, cancel));
+        let remote_res = list_remote_tree(&bin, managed_conf, &remote, cancel);
+        let local_res = local_handle
+            .join()
+            .unwrap_or_else(|_| Err(anyhow!("local scan thread panicked")));
+        (local_res, remote_res)
+    });
+    let (local_map, local_exact_dups, local_mac) = local_res?;
+    let (remote_map, duplicate_remote_paths, remote_mac, remote_root_exists) = remote_res?;
 
     let manifest = db.load_manifest_map("cloud", &profile.id)?;
     let pending_updates = db.list_pending_intentional_updates_for_target("cloud", &profile.id)?;
@@ -822,6 +849,98 @@ fn verify_cloud_inner(
     let all_keys: HashSet<&String> = local_map.keys().chain(remote_map.keys()).collect();
     let mut sorted_keys: Vec<&String> = all_keys.into_iter().collect();
     sorted_keys.sort();
+
+    // Pre-compute needed local MD5s (for deep_md5 or GPS backfill candidates) in parallel with
+    // per-thread reused 1 MiB buffers instead of hashing sequentially one file at a time.
+    let mut md5_targets: HashSet<&Path> = HashSet::new();
+    for &rel in &sorted_keys {
+        if dup_remote_set.contains(rel) || local_exact_dups.contains(rel) {
+            continue;
+        }
+        let lower = rel.to_lowercase();
+        let loc_bucket_len = local_lower_groups.get(&lower).map_or(0, Vec::len);
+        let rem_bucket_len = remote_lower_groups.get(&lower).map_or(0, Vec::len);
+        if loc_bucket_len > 1 || rem_bucket_len > 1 {
+            continue;
+        }
+        match (local_map.get(rel), remote_map.get(rel)) {
+            (Some(l), Some(r)) => {
+                let needs_bf = intentional_by_rel
+                    .get(rel)
+                    .is_some_and(|(_, pre_set, post_md5)| {
+                        r.md5.as_deref().is_some_and(|rm| {
+                            !rm.eq_ignore_ascii_case(post_md5)
+                                && pre_set.contains(&rm.to_ascii_lowercase())
+                        })
+                    });
+                if needs_bf || (deep_md5 && l.size == r.size && r.md5.is_some()) {
+                    md5_targets.insert(l.abs_path.as_path());
+                }
+            }
+            (Some(l), None) if deep_md5 => {
+                if let Some(rem_variant) = remote_lower_groups.get(&lower).and_then(|v| v.first()) {
+                    let r = &remote_map[rem_variant];
+                    if l.size == r.size && r.md5.is_some() {
+                        md5_targets.insert(l.abs_path.as_path());
+                    }
+                }
+            }
+            (None, Some(r)) if deep_md5 => {
+                if let Some(loc_variant) = local_lower_groups.get(&lower).and_then(|v| v.first()) {
+                    let l = &local_map[loc_variant];
+                    if l.size == r.size && r.md5.is_some() {
+                        md5_targets.insert(l.abs_path.as_path());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let precomputed_md5s: HashMap<PathBuf, Result<String, String>> = if md5_targets.len() > 1 {
+        let targets: Vec<PathBuf> = md5_targets.into_iter().map(Path::to_path_buf).collect();
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 6);
+        if let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+            pool.install(|| {
+                targets
+                    .par_iter()
+                    .map_init(
+                        || vec![0u8; 1024 * 1024],
+                        |buf, p| {
+                            if cancel.is_cancelled() {
+                                return (p.clone(), Err("Sync cancelled.".to_string()));
+                            }
+                            let res = compute_file_md5_with_buf(p, buf).map_err(|e| e.to_string());
+                            (p.clone(), res)
+                        },
+                    )
+                    .collect()
+            })
+        } else {
+            let mut buf = vec![0u8; 1024 * 1024];
+            targets
+                .into_iter()
+                .map(|p| {
+                    let res = compute_file_md5_with_buf(&p, &mut buf).map_err(|e| e.to_string());
+                    (p, res)
+                })
+                .collect()
+        }
+    } else if md5_targets.len() == 1 {
+        let p = md5_targets.into_iter().next().unwrap().to_path_buf();
+        let res = compute_file_md5(&p).map_err(|e| e.to_string());
+        HashMap::from([(p, res)])
+    } else {
+        HashMap::new()
+    };
+    let lookup_local_md5 = |p: &Path| -> Result<String, String> {
+        if let Some(res) = precomputed_md5s.get(p) {
+            return res.clone();
+        }
+        compute_file_md5(p).map_err(|e| e.to_string())
+    };
 
     // Only prune stale manifest entries when the remote root actually exists (never wipe tombstones on typo/missing folder!)
     if remote_root_exists {
@@ -899,7 +1018,7 @@ fn verify_cloud_inner(
                         let same = if l.size != r.size {
                             false
                         } else if deep_md5 {
-                            match (&r.md5, compute_file_md5(&l.abs_path)) {
+                            match (&r.md5, lookup_local_md5(&l.abs_path)) {
                                 (Some(rm), Ok(lm)) => rm.eq_ignore_ascii_case(&lm),
                                 (_, Err(_)) => false,
                                 (None, Ok(_)) => true,
@@ -940,7 +1059,7 @@ fn verify_cloud_inner(
                         let same = if l.size != r.size {
                             false
                         } else if deep_md5 {
-                            match (&r.md5, compute_file_md5(&l.abs_path)) {
+                            match (&r.md5, lookup_local_md5(&l.abs_path)) {
                                 (Some(rm), Ok(lm)) => rm.eq_ignore_ascii_case(&lm),
                                 (_, Err(_)) => false,
                                 (None, Ok(_)) => true,
@@ -994,7 +1113,7 @@ fn verify_cloud_inner(
                         if rm.eq_ignore_ascii_case(post_md5) {
                             auto_applied_update_ids.extend(ids.iter().cloned());
                         } else if pre_set.contains(&rm.to_ascii_lowercase()) {
-                            if let Ok(cur_md5) = compute_file_md5(&l.abs_path) {
+                            if let Ok(cur_md5) = lookup_local_md5(&l.abs_path) {
                                 if cur_md5.eq_ignore_ascii_case(post_md5) {
                                     pending_bytes = pending_bytes.saturating_add(l.size);
                                     backfill_updates.push(SyncDiffItem {
@@ -1019,7 +1138,7 @@ fn verify_cloud_inner(
                 let content_same = if !size_same {
                     false
                 } else if deep_md5 {
-                    match (&r.md5, compute_file_md5(&l.abs_path)) {
+                    match (&r.md5, lookup_local_md5(&l.abs_path)) {
                         (Some(rm), Ok(lm)) => rm.eq_ignore_ascii_case(&lm),
                         (_, Err(e)) => {
                             hash_error_note = Some(format!(
@@ -1035,15 +1154,26 @@ fn verify_cloud_inner(
 
                 if content_same {
                     up_to_date_count += 1;
-                    confirmed_both.push(ManifestEntry {
-                        profile_kind: "cloud".into(),
-                        profile_id: profile.id.clone(),
-                        rel_path: rel.clone(),
-                        size_bytes: l.size as i64,
-                        md5_hash: r.md5.clone(),
-                        mtime_unix: l.mtime_unix,
-                        state: "synced".into(),
-                    });
+                    let needs_upsert = match manifest.get(rel) {
+                        Some(existing) => {
+                            existing.size_bytes != l.size as i64
+                                || existing.mtime_unix != l.mtime_unix
+                                || existing.state != "synced"
+                                || (r.md5.is_some() && existing.md5_hash != r.md5)
+                        }
+                        None => true,
+                    };
+                    if needs_upsert {
+                        confirmed_both.push(ManifestEntry {
+                            profile_kind: "cloud".into(),
+                            profile_id: profile.id.clone(),
+                            rel_path: rel.clone(),
+                            size_bytes: l.size as i64,
+                            md5_hash: r.md5.clone(),
+                            mtime_unix: l.mtime_unix,
+                            state: "synced".into(),
+                        });
+                    }
                 } else {
                     conflicts.push(SyncDiffItem {
                         rel_path: rel.clone(),
@@ -1217,7 +1347,7 @@ pub fn sync_cloud_profile<F>(
     on_progress: F,
 ) -> Result<CloudSyncResult>
 where
-    F: Fn(&str, usize, usize),
+    F: Fn(&str, usize, usize) + Sync,
 {
     let started = Instant::now();
     let bin = resolve_rclone_binary(settings.rclone_path_override.as_deref()).ok_or_else(|| {
@@ -1263,74 +1393,101 @@ where
     let mut backfill_replaced = 0usize;
     let mut backfill_failed = 0usize;
 
-    // Step 0: Safe GPS backfill replacements (re-verifies local MD5 == post_md5 right before copyto!)
+    // Step 0: Safe GPS backfill replacements (re-verifies local MD5 == post_md5 & live remote MD5 right before copyto!)
+    // Parallelized up to 4 concurrent uploads when multiple geotagged photos are queued.
     if !restore_mode && !report.backfill_updates.is_empty() {
         let total_bf = report.backfill_updates.len();
+        let bf_done = AtomicUsize::new(0);
+        let bf_ok = AtomicUsize::new(0);
+        let bf_fail = AtomicUsize::new(0);
+        let bf_notes: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let bf_last_emit = Mutex::new(Instant::now() - Duration::from_secs(1));
+        let bf_threads = total_bf.clamp(1, 4);
 
-        for (idx, item) in report.backfill_updates.iter().enumerate() {
+        let run_one_backfill = |item: &SyncDiffItem, md5_buf: &mut [u8]| {
             if cancel.is_cancelled() {
-                return Err(anyhow!("Sync cancelled."));
+                return;
             }
-            on_progress(
-                &format!(
-                    "Updating geotagged photo on Drive ({}/{total_bf})…",
-                    idx + 1
-                ),
-                idx + 1,
-                total_bf,
-            );
+            let done_now = bf_done.fetch_add(1, Ordering::Relaxed) + 1;
+            let should_emit = if done_now == total_bf {
+                true
+            } else {
+                let mut g = bf_last_emit.lock();
+                if g.elapsed() >= Duration::from_millis(80) {
+                    *g = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_emit {
+                on_progress(
+                    &format!("Updating geotagged photo on Drive ({done_now}/{total_bf})…"),
+                    done_now,
+                    total_bf,
+                );
+            }
             let Some(loc_meta) = ctx.local_map.get(&item.rel_path) else {
-                backfill_failed += 1;
-                continue;
+                bf_fail.fetch_add(1, Ordering::Relaxed);
+                return;
             };
             let Some(rem_meta) = ctx.remote_map.get(&item.rel_path) else {
-                backfill_failed += 1;
-                continue;
+                bf_fail.fetch_add(1, Ordering::Relaxed);
+                return;
             };
             let Some((ids, pre_set, post_md5)) = ctx.intentional_by_rel.get(&item.rel_path) else {
-                backfill_failed += 1;
-                continue;
+                bf_fail.fetch_add(1, Ordering::Relaxed);
+                return;
             };
             // Re-verify local file still matches expected post_md5 (local TOCTOU guard)
-            let cur_md5 = match compute_file_md5(&loc_meta.abs_path) {
+            let cur_md5 = match compute_file_md5_with_buf(&loc_meta.abs_path, md5_buf) {
                 Ok(h) if h.eq_ignore_ascii_case(post_md5) => h,
                 Ok(_) => {
-                    backfill_failed += 1;
-                    notes.push(format!(
+                    bf_fail.fetch_add(1, Ordering::Relaxed);
+                    bf_notes.lock().push(format!(
                         "Skipped GPS backfill for {}: local file changed after geotagging",
                         item.rel_path
                     ));
-                    continue;
+                    return;
                 }
                 Err(e) => {
-                    backfill_failed += 1;
-                    notes.push(format!(
+                    bf_fail.fetch_add(1, Ordering::Relaxed);
+                    bf_notes.lock().push(format!(
                         "Skipped GPS backfill for {}: failed to read local file ({e})",
                         item.rel_path
                     ));
-                    continue;
+                    return;
                 }
             };
 
             let remote_file = join_remote_path(&remote, &rem_meta.raw_path);
             // Re-verify live remote MD5 immediately before replacing (remote TOCTOU guard)
-            match fetch_single_remote_md5(&bin, managed_conf, &remote_file, cancel)? {
-                Some(live_md5) if pre_set.contains(&live_md5) => {}
-                Some(_) => {
-                    backfill_failed += 1;
-                    notes.push(format!(
+            match fetch_single_remote_md5(&bin, managed_conf, &remote_file, cancel) {
+                Ok(Some(live_md5)) if pre_set.contains(&live_md5) => {}
+                Ok(Some(_)) => {
+                    bf_fail.fetch_add(1, Ordering::Relaxed);
+                    bf_notes.lock().push(format!(
                         "Skipped GPS backfill for {}: remote Drive copy changed since scan",
                         item.rel_path
                     ));
-                    continue;
+                    return;
                 }
-                None => {
-                    backfill_failed += 1;
-                    notes.push(format!(
+                Ok(None) => {
+                    bf_fail.fetch_add(1, Ordering::Relaxed);
+                    bf_notes.lock().push(format!(
                         "Skipped GPS backfill for {}: could not re-verify remote Drive MD5",
                         item.rel_path
                     ));
-                    continue;
+                    return;
+                }
+                Err(_) if cancel.is_cancelled() => return,
+                Err(e) => {
+                    bf_fail.fetch_add(1, Ordering::Relaxed);
+                    bf_notes.lock().push(format!(
+                        "Skipped GPS backfill for {}: failed checking remote MD5 ({e})",
+                        item.rel_path
+                    ));
+                    return;
                 }
             }
 
@@ -1339,6 +1496,8 @@ where
                 "copyto",
                 "--checksum",
                 "--no-traverse",
+                "--drive-chunk-size",
+                "64M",
                 "--drive-skip-gdocs",
                 "--drive-stop-on-upload-limit",
                 "--retries",
@@ -1348,36 +1507,70 @@ where
                 cmd.args(["--bwlimit", bw]);
             }
             cmd.arg("--").arg(&loc_meta.abs_path).arg(&remote_file);
-            let out = run_rclone_cancellable(cmd, cancel)?;
-            if out.success {
-                backfill_replaced += 1;
-                let _ = db.mark_intentional_updates_applied(ids, "cloud", &profile.id);
-                if let Ok(meta) = std::fs::metadata(&loc_meta.abs_path) {
-                    let mtime = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    let _ = db.upsert_manifest_entries(&[ManifestEntry {
-                        profile_kind: "cloud".into(),
-                        profile_id: profile.id.clone(),
-                        rel_path: item.rel_path.clone(),
-                        size_bytes: meta.len() as i64,
-                        md5_hash: Some(cur_md5),
-                        mtime_unix: mtime,
-                        state: "synced".into(),
-                    }]);
+            let out = match run_rclone_cancellable(cmd, cancel) {
+                Ok(o) => o,
+                Err(_) if cancel.is_cancelled() => return,
+                Err(e) => {
+                    bf_fail.fetch_add(1, Ordering::Relaxed);
+                    bf_notes.lock().push(format!(
+                        "GPS backfill update failed for {}: {e}",
+                        item.rel_path
+                    ));
+                    return;
                 }
+            };
+            if out.success {
+                bf_ok.fetch_add(1, Ordering::Relaxed);
+                let _ = db.mark_intentional_updates_applied(ids, "cloud", &profile.id);
+                let _ = db.upsert_manifest_entries(&[ManifestEntry {
+                    profile_kind: "cloud".into(),
+                    profile_id: profile.id.clone(),
+                    rel_path: item.rel_path.clone(),
+                    size_bytes: loc_meta.size as i64,
+                    md5_hash: Some(cur_md5),
+                    mtime_unix: loc_meta.mtime_unix,
+                    state: "synced".into(),
+                }]);
             } else {
-                backfill_failed += 1;
-                notes.push(format!(
+                bf_fail.fetch_add(1, Ordering::Relaxed);
+                bf_notes.lock().push(format!(
                     "GPS backfill update failed for {}: {}",
                     item.rel_path,
                     String::from_utf8_lossy(&out.stderr).trim()
                 ));
             }
+        };
+
+        if bf_threads > 1 {
+            if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+                .num_threads(bf_threads)
+                .build()
+            {
+                pool.install(|| {
+                    report.backfill_updates.par_iter().for_each_init(
+                        || vec![0u8; 1024 * 1024],
+                        |buf, item| run_one_backfill(item, buf),
+                    );
+                });
+            } else {
+                let mut buf = vec![0u8; 1024 * 1024];
+                for item in &report.backfill_updates {
+                    run_one_backfill(item, &mut buf);
+                }
+            }
+        } else {
+            let mut buf = vec![0u8; 1024 * 1024];
+            for item in &report.backfill_updates {
+                run_one_backfill(item, &mut buf);
+            }
         }
+
+        if cancel.is_cancelled() {
+            return Err(anyhow!("Sync cancelled."));
+        }
+        backfill_replaced = bf_ok.load(Ordering::Relaxed);
+        backfill_failed = bf_fail.load(Ordering::Relaxed);
+        notes.extend(bf_notes.into_inner());
     }
 
     // Step 1: Pass 1 (Drive -> Local) using exact raw remote paths + --partial-suffix .truongsync.part
@@ -1449,6 +1642,11 @@ where
                 ])
                 .arg(manifest_file.path())
                 .args([
+                    if batch_dl.len() <= 500 {
+                        "--no-traverse"
+                    } else {
+                        "--fast-list"
+                    },
                     "--drive-skip-gdocs",
                     "--transfers",
                     "4",
@@ -1626,6 +1824,13 @@ where
                 .args(["copy", "--immutable", "--files-from-raw"])
                 .arg(ul_manifest.path())
                 .args([
+                    if batch_ul.len() <= 500 {
+                        "--no-traverse"
+                    } else {
+                        "--fast-list"
+                    },
+                    "--drive-chunk-size",
+                    "64M",
                     "--drive-skip-gdocs",
                     "--drive-stop-on-upload-limit",
                     "--transfers",
@@ -1653,23 +1858,14 @@ where
                 uploaded_count += batch_ul.len();
                 let ul_entries: Vec<ManifestEntry> = batch_ul
                     .iter()
-                    .filter_map(|(item, loc_meta)| {
-                        let meta = std::fs::metadata(&loc_meta.abs_path).ok()?;
-                        let mtime = meta
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        Some(ManifestEntry {
-                            profile_kind: "cloud".into(),
-                            profile_id: profile.id.clone(),
-                            rel_path: item.rel_path.clone(),
-                            size_bytes: meta.len() as i64,
-                            md5_hash: None,
-                            mtime_unix: mtime,
-                            state: "synced".into(),
-                        })
+                    .map(|(item, loc_meta)| ManifestEntry {
+                        profile_kind: "cloud".into(),
+                        profile_id: profile.id.clone(),
+                        rel_path: item.rel_path.clone(),
+                        size_bytes: loc_meta.size as i64,
+                        md5_hash: None,
+                        mtime_unix: loc_meta.mtime_unix,
+                        state: "synced".into(),
                     })
                     .collect();
                 let _ = db.upsert_manifest_entries(&ul_entries);
@@ -1686,6 +1882,8 @@ where
                 cmd.arg("--config").arg(managed_conf).args([
                     "copyto",
                     "--immutable",
+                    "--drive-chunk-size",
+                    "64M",
                     "--drive-skip-gdocs",
                     "--drive-stop-on-upload-limit",
                 ]);

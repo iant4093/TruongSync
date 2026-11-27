@@ -38,6 +38,16 @@ const BLANK_EXTERNAL: ExternalProfile = {
   stale_after_days: 14,
 };
 
+function externalVerifyStamp(p: ExternalProfile): string {
+  return JSON.stringify([
+    p.last_sync_at,
+    p.last_verify_at,
+    p.pending_push_count,
+    p.pending_pull_count,
+    p.pending_bytes,
+  ]);
+}
+
 export const DriveBackupView: React.FC = () => {
   const externalProfiles = useSyncStore((s) => s.externalProfiles);
   const volumes = useSyncStore((s) => s.volumes);
@@ -49,23 +59,31 @@ export const DriveBackupView: React.FC = () => {
   const [staleDaysText, setStaleDaysText] = useState('14');
   const [busyMap, setBusyMap] = useState<Record<string, 'verify' | 'sync'>>({});
   const [reports, setReports] = useState<Record<string, ExternalVerifyReport>>({});
-  const [reportSyncStamps, setReportSyncStamps] = useState<Record<string, string | null>>({});
+  const [reportSyncStamps, setReportSyncStamps] = useState<Record<string, string>>({});
 
-  // Auto-invalidate stale verify reports when a background/pipeline sync finishes or drive disconnects.
+  // Auto-invalidate stale verify reports when a background/pipeline/partial sync finishes
+  // or when the external drive disconnects (so reconnecting never resurrects a stale report).
   useEffect(() => {
     setReports((prev) => {
       let changed = false;
       const next = { ...prev };
       for (const id of Object.keys(prev)) {
         const p = externalProfiles.find((e) => e.id === id);
-        if (!p || p.last_sync_at !== reportSyncStamps[id]) {
+        const connected = p
+          ? volumes.some((v) =>
+              p.volume_uuid
+                ? v.volume_uuid.toLowerCase() === p.volume_uuid.toLowerCase()
+                : Boolean(p.volume_label) && v.label.toLowerCase() === p.volume_label.toLowerCase(),
+            )
+          : false;
+        if (!p || !connected || externalVerifyStamp(p) !== reportSyncStamps[id]) {
           delete next[id];
           changed = true;
         }
       }
       return changed ? next : prev;
     });
-  }, [externalProfiles, reportSyncStamps]);
+  }, [externalProfiles, volumes, reportSyncStamps]);
 
   const openEditor = (profile: ExternalProfile) => {
     setEditing(profile);
@@ -140,10 +158,17 @@ export const DriveBackupView: React.FC = () => {
     setProfileBusy(profileId, 'verify');
     try {
       const rep = await api.verifyExternal(profileId, deepMd5);
-      const syncStamp = externalProfiles.find((e) => e.id === profileId)?.last_sync_at ?? null;
-      setReportSyncStamps((prev) => ({ ...prev, [profileId]: syncStamp }));
-      setReports((prev) => ({ ...prev, [profileId]: rep }));
       await refreshProfiles();
+      const freshProfile = useSyncStore
+        .getState()
+        .externalProfiles.find((e) => e.id === profileId);
+      if (freshProfile) {
+        setReportSyncStamps((prev) => ({
+          ...prev,
+          [profileId]: externalVerifyStamp(freshProfile),
+        }));
+      }
+      setReports((prev) => ({ ...prev, [profileId]: rep }));
       if (!rep.volume_connected) {
         notifyError('External drive is not currently connected.');
       } else {

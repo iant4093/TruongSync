@@ -297,12 +297,14 @@ fn parse_fixed_offset(raw: &str) -> Option<FixedOffset> {
     trimmed.parse::<FixedOffset>().ok()
 }
 
-fn read_photo_exif_time_and_gps(path: &Path) -> (Option<DateTime<Utc>>, bool) {
+fn read_photo_exif_time_and_gps(
+    path: &Path,
+    parser: &mut MediaParser,
+) -> (Option<DateTime<Utc>>, bool) {
     let is_cr3 = path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("cr3"));
 
-    let mut parser = MediaParser::new();
     let Ok(ms) = MediaSource::open(path) else {
         return (None, is_cr3 && cr3_has_gps_box(path));
     };
@@ -425,7 +427,7 @@ pub fn build_geotag_plan(
         .ok_or_else(|| anyhow::anyhow!("clock_offset_secs out of valid range"))?;
     let mut items: Vec<PhotoGpsMatch> = files
         .par_iter()
-        .map(|(path, kind)| {
+        .map_init(MediaParser::new, |parser, (path, kind)| {
             let filename = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -454,7 +456,7 @@ pub fn build_geotag_plan(
                 };
             }
 
-            let (raw_ts, has_existing) = read_photo_exif_time_and_gps(path);
+            let (raw_ts, has_existing) = read_photo_exif_time_and_gps(path, parser);
             let Some(ts) = raw_ts else {
                 return PhotoGpsMatch {
                     path: path_str,
