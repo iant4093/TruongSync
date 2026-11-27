@@ -41,8 +41,30 @@ const EXIFTOOL_SHA256 = {
 };
 
 const cliArgs = process.argv.slice(2);
-const targetIdx = cliArgs.indexOf('--target');
-const targetTriple = targetIdx >= 0 ? cliArgs[targetIdx + 1] : null;
+function readCliFlag(args, longName, shortName) {
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i];
+    if (a === longName || (shortName && a === shortName)) {
+      if (i + 1 >= args.length || args[i + 1].startsWith('-')) {
+        throw new Error(`Missing value for ${a}`);
+      }
+      return args[i + 1];
+    }
+    if (a.startsWith(`${longName}=`)) {
+      const val = a.slice(longName.length + 1);
+      if (!val) throw new Error(`Missing value for ${longName}=`);
+      return val;
+    }
+  }
+  return null;
+}
+
+const targetTriple = readCliFlag(cliArgs, '--target', '-t');
+if (targetTriple && targetTriple.includes('universal-apple-darwin')) {
+  throw new Error(
+    'Unsupported target "universal-apple-darwin": build aarch64-apple-darwin and x86_64-apple-darwin separately so rclone matches the CPU architecture.',
+  );
+}
 
 const hostPlatform = process.platform;
 const hostArch = process.arch;
@@ -61,9 +83,14 @@ const targetArch = targetTriple
     : 'x64'
   : hostArch;
 
+const hasRosetta =
+  hostPlatform === 'darwin' &&
+  hostArch === 'arm64' &&
+  fs.existsSync('/Library/Apple/usr/share/rosetta/rosetta');
+
 const canExecuteTarget =
   targetPlatform === hostPlatform &&
-  (targetArch === hostArch || (hostPlatform === 'darwin' && hostArch === 'arm64' && targetArch === 'x64'));
+  (targetArch === hostArch || (hasRosetta && targetArch === 'x64'));
 
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
@@ -77,9 +104,29 @@ function sha256File(filePath) {
 
 function downloadFile(url, dest) {
   console.log(`Downloading ${url}...`);
-  execFileSync('curl', ['-fsSL', '-L', '--retry', '3', '--retry-delay', '2', '-A', 'curl/8.7.1', '-o', dest, url], {
-    stdio: 'inherit',
-  });
+  execFileSync(
+    'curl',
+    [
+      '-fsSL',
+      '--connect-timeout',
+      '15',
+      '--max-time',
+      '180',
+      '--retry',
+      '3',
+      '--retry-delay',
+      '2',
+      '-A',
+      'curl/8.7.1',
+      '-o',
+      dest,
+      url,
+    ],
+    {
+      stdio: 'inherit',
+      timeout: 210_000,
+    },
+  );
 }
 
 function downloadVerified(urls, dest, expectedSha256) {

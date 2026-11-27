@@ -3,6 +3,7 @@ import type { CSSProperties, KeyboardEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { Check, ChevronDown } from 'lucide-react';
 import { isTopEscapeLayer, popEscapeLayer, pushEscapeLayer } from '../lib/escapeStack';
+import { useSyncStore } from '../store/useSyncStore';
 
 type Option<T> = readonly [value: T, label: string];
 
@@ -24,12 +25,19 @@ export function Dropdown<T extends string | number>({
   disabled?: boolean;
 }) {
   const id = useId();
+  const activeNav = useSyncStore((s) => s.activeNav);
   const trigger = useRef<HTMLButtonElement>(null);
   const menu = useRef<HTMLUListElement>(null);
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const [position, setPosition] = useState<CSSProperties>({});
   const selected = options.findIndex(([key]) => key === value);
+
+  // Close any open portaled menu when switching tabs so hidden views never keep portals visible
+  // or swallow Escape key events.
+  useEffect(() => {
+    setOpen(false);
+  }, [activeNav]);
 
   const choose = (index: number) => {
     const option = options[index];

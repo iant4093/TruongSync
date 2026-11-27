@@ -33,21 +33,41 @@ export const SettingsView: React.FC = () => {
   const [osAutoLaunchBusy, setOsAutoLaunchBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const dirtyRef = useRef(false);
+  const dirtyFieldsRef = useRef<Set<keyof AppSettings>>(new Set());
 
   const updateDraft = (patch: Partial<AppSettings>) => {
     dirtyRef.current = true;
+    for (const k of Object.keys(patch) as Array<keyof AppSettings>) {
+      dirtyFieldsRef.current.add(k);
+    }
     setDraft((prev) => (prev ? { ...prev, ...patch } : prev));
   };
 
   useEffect(() => {
     if (!settings) return;
     if (!dirtyRef.current || !draft) {
+      dirtyFieldsRef.current.clear();
       setDraft(settings);
       setCategoriesText(settings.default_categories.join(', '));
       setBandwidthText(settings.bandwidth_limit_mbps != null ? String(settings.bandwidth_limit_mbps) : '');
       setThreadsText(String(settings.import_threads));
       setStaleDaysText(String(settings.stale_warning_days));
+      return;
     }
+    // Even if user has unsaved edits in Settings, merge non-dirty external updates
+    // (such as QuickSetupCard updating default_import_root or watched_gpx_folder).
+    setDraft((prev) => {
+      if (!prev) return settings;
+      const merged: AppSettings = { ...prev };
+      let changed = false;
+      for (const k of ['default_import_root', 'watched_gpx_folder', 'os_native_auto_launch'] as const) {
+        if (!dirtyFieldsRef.current.has(k) && prev[k] !== settings[k]) {
+          (merged as unknown as Record<string, unknown>)[k] = settings[k];
+          changed = true;
+        }
+      }
+      return changed ? merged : prev;
+    });
   }, [settings]);
 
   useEffect(() => {
@@ -117,6 +137,7 @@ export const SettingsView: React.FC = () => {
       };
       await api.saveSettings(next);
       dirtyRef.current = false;
+      dirtyFieldsRef.current.clear();
       await refreshSettings();
       await refreshProfiles();
       await refreshTools();

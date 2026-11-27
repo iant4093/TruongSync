@@ -533,6 +533,7 @@ where
     let total = to_write.len();
     let mut protocol_broken = false;
     let mut was_cancelled = false;
+    let mut in_flight: Option<(String, PathBuf, String)> = None;
 
     for (idx, item) in to_write.iter().enumerate() {
         if cancel.is_cancelled() {
@@ -622,10 +623,12 @@ where
         args.push(format!("-execute{seq}"));
 
         let payload = format!("{}\n", args.join("\n"));
+        in_flight = Some((item.path.clone(), canon_path.clone(), pre_md5.clone()));
         if let Err(e) = stdin
             .write_all(payload.as_bytes())
             .and_then(|_| stdin.flush())
         {
+            in_flight = None;
             protocol_broken = true;
             failures.push((
                 item.path.clone(),
@@ -710,6 +713,7 @@ where
         let errs = err_lines.join(" | ");
 
         if combined.contains("1 image files updated") {
+            in_flight = None;
             match compute_file_md5(&canon_path) {
                 Ok(post_md5) if post_md5 != pre_md5 => {
                     let rec = GeotagWriteRecord {
@@ -728,8 +732,12 @@ where
         } else if combined.contains("1 image files unchanged")
             || combined.contains("1 files failed condition")
         {
+            in_flight = None;
             skipped_count += 1;
         } else {
+            if reached_ready {
+                in_flight = None;
+            }
             let detail = if timed_out {
                 format!(
                     "ExifTool timed out after {}s while writing GPS metadata",
@@ -744,19 +752,23 @@ where
                 }
             };
             failures.push((item.path.clone(), detail));
-            if !reached_ready {
-                protocol_broken = true;
-                for rem in &to_write[idx + 1..] {
-                    failures.push((
-                        rem.path.clone(),
-                        "Skipped after ExifTool process terminated early".into(),
-                    ));
-                }
-                break;
-            }
         }
 
         on_progress(idx + 1, total, &item.filename);
+
+        // If ExifTool did not emit `{ready{seq}}` (e.g. crashed/timed out after printing
+        // "1 image files updated"), abort the batch immediately rather than writing to a
+        // dead or desynchronized process.
+        if !reached_ready {
+            protocol_broken = true;
+            for rem in &to_write[idx + 1..] {
+                failures.push((
+                    rem.path.clone(),
+                    "Skipped after ExifTool process terminated early".into(),
+                ));
+            }
+            break;
+        }
     }
 
     // Drop channel receivers BEFORE waiting so ExifTool cannot block writing to a full pipe
@@ -788,6 +800,26 @@ where
                     force_killed = true;
                     break;
                 }
+            }
+        }
+    }
+
+    // After force-killing an in-flight write (cancel or timeout), clean up any orphaned
+    // `_exiftool_tmp` sibling and reconcile MD5 so a photo already atomically replaced on disk
+    // right before termination never loses its `intentional_updates` backfill record.
+    if let Some((item_path, canon_path, pre_md5)) = in_flight {
+        let mut tmp_os = canon_path.as_os_str().to_os_string();
+        tmp_os.push("_exiftool_tmp");
+        let _ = std::fs::remove_file(PathBuf::from(tmp_os));
+        if let Ok(post_md5) = compute_file_md5(&canon_path) {
+            if post_md5 != pre_md5 {
+                let rec = GeotagWriteRecord {
+                    path: item_path,
+                    pre_md5,
+                    post_md5,
+                };
+                on_updated(&rec);
+                updated_records.push(rec);
             }
         }
     }

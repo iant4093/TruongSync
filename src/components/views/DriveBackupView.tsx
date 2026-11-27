@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   CheckCircle2,
   Download,
@@ -49,6 +49,23 @@ export const DriveBackupView: React.FC = () => {
   const [staleDaysText, setStaleDaysText] = useState('14');
   const [busyMap, setBusyMap] = useState<Record<string, 'verify' | 'sync'>>({});
   const [reports, setReports] = useState<Record<string, ExternalVerifyReport>>({});
+  const [reportSyncStamps, setReportSyncStamps] = useState<Record<string, string | null>>({});
+
+  // Auto-invalidate stale verify reports when a background/pipeline sync finishes or drive disconnects.
+  useEffect(() => {
+    setReports((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const id of Object.keys(prev)) {
+        const p = externalProfiles.find((e) => e.id === id);
+        if (!p || p.last_sync_at !== reportSyncStamps[id]) {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [externalProfiles, reportSyncStamps]);
 
   const openEditor = (profile: ExternalProfile) => {
     setEditing(profile);
@@ -92,8 +109,12 @@ export const DriveBackupView: React.FC = () => {
         return;
       }
     }
+    const parsedDays = Number(staleDaysText.trim());
+    if (!Number.isInteger(parsedDays) || parsedDays < 1 || parsedDays > 3650) {
+      notifyError('Freshness warning days must be a whole number between 1 and 3650.');
+      return;
+    }
     try {
-      const parsedDays = Math.max(1, Math.trunc(Number(staleDaysText.trim()) || 14));
       const savedId = editing.id;
       await api.saveExternalProfile({
         ...editing,
@@ -119,6 +140,8 @@ export const DriveBackupView: React.FC = () => {
     setProfileBusy(profileId, 'verify');
     try {
       const rep = await api.verifyExternal(profileId, deepMd5);
+      const syncStamp = externalProfiles.find((e) => e.id === profileId)?.last_sync_at ?? null;
+      setReportSyncStamps((prev) => ({ ...prev, [profileId]: syncStamp }));
       setReports((prev) => ({ ...prev, [profileId]: rep }));
       await refreshProfiles();
       if (!rep.volume_connected) {
@@ -517,7 +540,7 @@ export const DriveBackupView: React.FC = () => {
                   </div>
                 </div>
 
-                {rep && rep.volume_connected && (
+                {rep && vol && rep.volume_connected && (
                   <div className="card-body" style={{ borderTop: '1px solid var(--border)', background: '#1e1e1e' }}>
                     <div className="row-between" style={{ marginBottom: 10 }}>
                       <div className="row-wrap">

@@ -16,14 +16,31 @@ import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
-const notesIdx = args.indexOf('--notes');
-const notes = notesIdx >= 0 ? args.splice(notesIdx, 2)[1] : '';
+
+function extractFlag(argv, longName, shortName, removeFromArgv = false) {
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === longName || (shortName && a === shortName)) {
+      const val = argv[i + 1] ?? '';
+      if (removeFromArgv) argv.splice(i, 2);
+      return val;
+    }
+    if (a.startsWith(`${longName}=`)) {
+      const val = a.slice(longName.length + 1);
+      if (removeFromArgv) argv.splice(i, 1);
+      return val;
+    }
+  }
+  return null;
+}
+
+const notes = extractFlag(args, '--notes', null, true) ?? '';
 
 const conf = JSON.parse(readFileSync(join(root, 'src-tauri', 'tauri.conf.json'), 'utf8'));
-const cfgIdx = args.indexOf('--config') >= 0 ? args.indexOf('--config') : args.indexOf('-c');
+const cfgRaw = extractFlag(args, '--config', '-c', false);
 let override = {};
-if (cfgIdx >= 0 && args[cfgIdx + 1]) {
-  const cfgArg = args[cfgIdx + 1].trim();
+if (cfgRaw) {
+  const cfgArg = cfgRaw.trim();
   if (cfgArg.startsWith('{')) {
     override = JSON.parse(cfgArg);
   } else if (existsSync(resolve(root, cfgArg))) {
@@ -33,8 +50,7 @@ if (cfgIdx >= 0 && args[cfgIdx + 1]) {
 const version = override.version ?? conf.version;
 const endpoint = override.plugins?.updater?.endpoints?.[0] ?? conf.plugins?.updater?.endpoints?.[0] ?? '';
 
-const targetIdx = args.indexOf('--target') >= 0 ? args.indexOf('--target') : args.indexOf('-t');
-const targetTriple = targetIdx >= 0 ? args[targetIdx + 1] : null;
+const targetTriple = extractFlag(args, '--target', '-t', false);
 
 // 1a. Fetch bundled rclone + ExifTool sidecars BEFORE loading the release signing private key
 const sidecarEnv = { ...process.env };

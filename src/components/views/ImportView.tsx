@@ -116,6 +116,7 @@ export const ImportView: React.FC = () => {
   const refreshSettings = useSyncStore((s) => s.refreshSettings);
 
   const hydratedPresetIdRef = useRef<string | null>(null);
+  const hydratedPresetSigRef = useRef<string | null>(null);
   const scanSeqRef = useRef(0);
 
   const defaultPreset = presets[0];
@@ -166,14 +167,37 @@ export const ImportView: React.FC = () => {
   const [running, setRunning] = useState(false);
   const [lastSummary, setLastSummary] = useState<PipelineSummary | null>(null);
 
-  // Hydrate form fields ONLY when preset selection changes (never clobber user edits on background profile refresh)
+  // Hydrate form fields when preset selection changes OR when the selected preset's saved
+  // defaults actually change (e.g. edited in SettingsView), while never clobbering user edits
+  // on unrelated background profile refreshes.
   useEffect(() => {
     const p = presets.find((x) => x.id === selectedPresetId) ?? presets[0];
     if (!p) return;
     if (!selectedPresetId) setSelectedPresetId(p.id);
-    if (hydratedPresetIdRef.current !== p.id) {
+    const sig = JSON.stringify([
+      p.id,
+      p.root_path,
+      p.folder_template,
+      p.date_format,
+      p.raw_folder,
+      p.jpeg_folder,
+      p.video_folder,
+      p.transfer_mode,
+      p.auto_geotag,
+      p.auto_cloud_sync,
+      p.auto_external_sync,
+      p.eject_after,
+    ]);
+    const presetSwitched = hydratedPresetIdRef.current !== p.id;
+    const presetDefaultsUpdated = !presetSwitched && hydratedPresetSigRef.current !== sig && !running;
+    if (presetSwitched || presetDefaultsUpdated) {
       hydratedPresetIdRef.current = p.id;
-      setDestRoot((prev) => prev || p.root_path || settings?.default_import_root || '');
+      hydratedPresetSigRef.current = sig;
+      setDestRoot((prev) =>
+        presetDefaultsUpdated
+          ? p.root_path || settings?.default_import_root || prev
+          : prev || p.root_path || settings?.default_import_root || '',
+      );
       setFolderTemplate(p.folder_template);
       setDateFormat(p.date_format);
       setRawFolder(p.raw_folder);
@@ -182,11 +206,13 @@ export const ImportView: React.FC = () => {
       setTransferMode(p.transfer_mode === 'copy' ? 'copy' : 'move');
       setGeotagEnabled(p.auto_geotag);
       setEjectAfter(p.eject_after);
-      if (p.auto_cloud_sync) {
-        setSelectedCloudIds(cloudProfiles.filter((c) => c.enabled).map((c) => c.id));
-      }
-      if (p.auto_external_sync) {
-        setSelectedExternalIds(externalProfiles.filter((e) => e.enabled).map((e) => e.id));
+      if (presetSwitched) {
+        if (p.auto_cloud_sync) {
+          setSelectedCloudIds(cloudProfiles.filter((c) => c.enabled).map((c) => c.id));
+        }
+        if (p.auto_external_sync) {
+          setSelectedExternalIds(externalProfiles.filter((e) => e.enabled).map((e) => e.id));
+        }
       }
     } else if (!destRoot && (p.root_path || settings?.default_import_root)) {
       setDestRoot(p.root_path || settings?.default_import_root || '');
@@ -277,7 +303,7 @@ export const ImportView: React.FC = () => {
 
   const handleScanSource = async (
     path: string,
-    opts?: { preserveSummary?: boolean; force?: boolean },
+    opts?: { preserveSummary?: boolean; force?: boolean; silentIfMissing?: boolean },
   ) => {
     if (running && !opts?.force) return;
     const seq = ++scanSeqRef.current;
@@ -318,7 +344,14 @@ export const ImportView: React.FC = () => {
       }
     } catch (err) {
       if (scanSeqRef.current === seq) {
-        notifyError(err, 'Card scan failed');
+        if (opts?.silentIfMissing) {
+          setSourceRoot('');
+          setScan(null);
+          setPreflight(null);
+          setPlanPreview(null);
+        } else {
+          notifyError(err, 'Card scan failed');
+        }
       }
     } finally {
       if (scanSeqRef.current === seq) {
@@ -509,7 +542,11 @@ export const ImportView: React.FC = () => {
         setPreflight(null);
         setPlanPreview(null);
       } else if (transferMode === 'move') {
-        await handleScanSource(sourceRoot, { preserveSummary: true, force: true });
+        await handleScanSource(sourceRoot, {
+          preserveSummary: true,
+          force: true,
+          silentIfMissing: true,
+        });
       }
     } catch (err) {
       notifyError(err, 'Import failed');

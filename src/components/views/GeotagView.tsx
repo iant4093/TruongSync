@@ -25,9 +25,12 @@ export const GeotagView: React.FC = () => {
   const [recordBackfill, setRecordBackfill] = useState(true);
 
   const clockOffsetSecs = Number.isFinite(Number(clockOffsetText))
-    ? Math.trunc(Number(clockOffsetText))
+    ? Math.max(-86400, Math.min(86400, Math.trunc(Number(clockOffsetText))))
     : 0;
-  const maxGapMins = Math.max(1, Math.trunc(Number(maxGapText)) || 15);
+  const maxGapParsed = Number(maxGapText.trim());
+  const maxGapValid =
+    Number.isInteger(maxGapParsed) && maxGapParsed >= 1 && maxGapParsed <= 1440;
+  const maxGapMins = maxGapValid ? maxGapParsed : 15;
 
   const [plan, setPlan] = useState<GeotagPlan | null>(null);
   const [previewSignature, setPreviewSignature] = useState<string | null>(null);
@@ -304,7 +307,7 @@ export const GeotagView: React.FC = () => {
             <button
               type="button"
               className="button button-primary"
-              disabled={loading || !targetFolder || gpxFiles.length === 0}
+              disabled={loading || writing || !targetFolder || gpxFiles.length === 0 || !maxGapValid}
               onClick={() => void handlePreview()}
             >
               <Play size={14} /> {loading ? 'Matching…' : 'Match & Preview on Map'}
@@ -324,15 +327,18 @@ export const GeotagView: React.FC = () => {
           }
           style={{ marginTop: 14 }}
         >
-          <strong>
-            {result.cancelled ? 'Geotagging cancelled' : 'Geotagging complete'}: {result.tagged_count}{' '}
-            photos tagged, {result.skipped_count} skipped, {result.failed_count} failed.
-          </strong>
-          {recordBackfill && result.tagged_count > 0 && (
-            <div style={{ marginTop: 4 }}>
-              Safe backfill hashes saved — run Google Drive or External Drive sync whenever ready to propagate the updated GPS EXIF.
-            </div>
-          )}
+          <div>
+            <strong>
+              {result.cancelled ? 'Geotagging cancelled' : 'Geotagging complete'}:{' '}
+              {result.tagged_count} photos tagged, {result.skipped_count} skipped,{' '}
+              {result.failed_count} failed.
+            </strong>
+            {recordBackfill && result.tagged_count > 0 && (
+              <div style={{ marginTop: 4 }}>
+                Safe backfill hashes saved — run Google Drive or External Drive sync whenever ready to propagate the updated GPS EXIF.
+              </div>
+            )}
+          </div>
         </div>
       )}
 

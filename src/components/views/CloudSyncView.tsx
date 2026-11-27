@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   CheckCircle2,
   CloudDownload,
@@ -53,6 +53,24 @@ export const CloudSyncView: React.FC = () => {
   const [oauthBusy, setOauthBusy] = useState(false);
   const [busyMap, setBusyMap] = useState<Record<string, 'verify' | 'sync'>>({});
   const [verifyReports, setVerifyReports] = useState<Record<string, CloudVerifyReport>>({});
+  const [reportSyncStamps, setReportSyncStamps] = useState<Record<string, string | null>>({});
+
+  // Auto-invalidate stale verify reports whenever a profile finishes syncing in the background
+  // (scheduled sync, tray "Sync Google Drive Now", or Import Stage 3).
+  useEffect(() => {
+    setVerifyReports((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const id of Object.keys(prev)) {
+        const p = cloudProfiles.find((c) => c.id === id);
+        if (!p || p.last_sync_at !== reportSyncStamps[id]) {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [cloudProfiles, reportSyncStamps]);
 
   const openEditor = (profile: CloudProfile) => {
     setEditing(profile);
@@ -115,8 +133,12 @@ export const CloudSyncView: React.FC = () => {
         return;
       }
     }
+    const parsedDays = Number(staleDaysText.trim());
+    if (!Number.isInteger(parsedDays) || parsedDays < 1 || parsedDays > 3650) {
+      notifyError('Freshness warning days must be a whole number between 1 and 3650.');
+      return;
+    }
     try {
-      const parsedDays = Math.max(1, Math.trunc(Number(staleDaysText.trim()) || 7));
       const savedId = editing.id;
       await api.saveCloudProfile({
         ...editing,
@@ -142,6 +164,8 @@ export const CloudSyncView: React.FC = () => {
     setProfileBusy(profileId, 'verify');
     try {
       const rep = await api.verifyCloud(profileId, deepMd5);
+      const syncStamp = cloudProfiles.find((c) => c.id === profileId)?.last_sync_at ?? null;
+      setReportSyncStamps((prev) => ({ ...prev, [profileId]: syncStamp }));
       setVerifyReports((prev) => ({ ...prev, [profileId]: rep }));
       await refreshProfiles();
       notifySuccess(

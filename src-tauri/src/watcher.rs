@@ -115,6 +115,24 @@ pub fn start_volume_watcher(app: AppHandle) {
                 };
                 let battery_blocked = !settings.sync_on_battery && on_batt;
 
+                let disconnected_profiles: Vec<String> = ext_profiles
+                    .iter()
+                    .filter(|p| {
+                        !current
+                            .iter()
+                            .any(|v| external_profile_matches_volume(p, v))
+                    })
+                    .map(|p| p.id.clone())
+                    .collect();
+                if !disconnected_profiles.is_empty() {
+                    if let Some(st) = app.try_state::<AppState>() {
+                        let mut def = st.deferred_on_connect.lock();
+                        for pid in disconnected_profiles {
+                            def.remove(&pid);
+                        }
+                    }
+                }
+
                 for vol in newly_arrived {
                     // 1. Camera SD card arrived -> auto-open Import tab!
                     if vol.has_dcim && settings.auto_open_on_sd_insert {
@@ -146,6 +164,9 @@ pub fn start_volume_watcher(app: AppHandle) {
                                     st.deferred_on_connect.lock().insert(profile.id.clone());
                                 }
                             } else {
+                                if let Some(st) = app.try_state::<AppState>() {
+                                    st.deferred_on_connect.lock().remove(&profile.id);
+                                }
                                 let app_clone = app.clone();
                                 let pid = profile.id.clone();
                                 let do_sync = profile.schedule_action == "sync";
@@ -295,15 +316,6 @@ pub fn start_background_scheduler(app: AppHandle) {
 
                     for p in ext_profiles.into_iter().filter(|p| p.enabled) {
                         let key = format!("external:{}", p.id);
-                        if app
-                            .try_state::<AppState>()
-                            .is_some_and(|st| st.is_external_locked(&p.id))
-                        {
-                            continue;
-                        }
-                        if recently_attempted(&last_failure.lock(), &key, 15) {
-                            continue;
-                        }
                         let connected = mounted_vols
                             .iter()
                             .any(|v| external_profile_matches_volume(&p, v));
@@ -314,6 +326,15 @@ pub fn start_background_scheduler(app: AppHandle) {
                             if let Some(st) = app.try_state::<AppState>() {
                                 st.deferred_on_connect.lock().remove(&p.id);
                             }
+                            continue;
+                        }
+                        if app
+                            .try_state::<AppState>()
+                            .is_some_and(|st| st.is_external_locked(&p.id))
+                        {
+                            continue;
+                        }
+                        if recently_attempted(&last_failure.lock(), &key, 15) {
                             continue;
                         }
                         let latest_ref = latest_timestamp(

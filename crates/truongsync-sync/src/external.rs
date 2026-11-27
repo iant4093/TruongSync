@@ -684,15 +684,16 @@ fn commit_part_file(part: &Path, dst: &Path, allow_overwrite: bool) -> Result<()
             use windows::core::PCWSTR;
             use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
             let to_wide_verbatim = |p: &Path| -> Vec<u16> {
-                let s = p.to_string_lossy();
-                let formatted = if s.len() >= 240 && !s.starts_with(r"\\?\") {
-                    if let Some(unc) = s.strip_prefix(r"\\") {
+                let norm = p.to_string_lossy().replace('/', r"\");
+                let formatted = if norm.encode_utf16().count() >= 240 && !norm.starts_with(r"\\?\")
+                {
+                    if let Some(unc) = norm.strip_prefix(r"\\") {
                         format!(r"\\?\UNC\{unc}")
                     } else {
-                        format!(r"\\?\{s}")
+                        format!(r"\\?\{norm}")
                     }
                 } else {
-                    s.into_owned()
+                    norm
                 };
                 std::ffi::OsStr::new(&formatted)
                     .encode_wide()
@@ -1157,6 +1158,7 @@ where
     }
 
     if !pushes.is_empty() || !backfills.is_empty() {
+        check_mount_device_identity(mount_guard)?;
         std::fs::create_dir_all(ext_root)?;
     }
 
@@ -1386,6 +1388,7 @@ where
         && profile.write_marker_file
         && ext_writable
         && ext_root.is_dir()
+        && check_mount_device_identity(mount_guard).is_ok()
     {
         let _ = update_last_sync_marker_file(ext_root);
     }

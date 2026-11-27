@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useLayoutEffect, useRef } from 'react';
 import { BatteryCharging } from 'lucide-react';
 import { isTauri } from './lib/tauri';
 import { useSyncStore } from './store/useSyncStore';
@@ -36,6 +36,19 @@ export const App: React.FC = () => {
   const inspectorOpen = Boolean(
     activeNav === 'activity' && inspectorJobId && jobs.some((j) => j.id === inspectorJobId),
   );
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const scrollByTabRef = useRef<Partial<Record<NavTab, number>>>({});
+  const prevTabRef = useRef<NavTab>(activeNav);
+
+  useLayoutEffect(() => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    if (prevTabRef.current !== activeNav) {
+      scrollByTabRef.current[prevTabRef.current] = vp.scrollTop;
+      prevTabRef.current = activeNav;
+      vp.scrollTop = scrollByTabRef.current[activeNav] ?? 0;
+    }
+  }, [activeNav]);
 
   useEffect(() => {
     void init();
@@ -76,7 +89,7 @@ export const App: React.FC = () => {
         </header>
 
         <div className={`workspace-body ${inspectorOpen ? 'with-inspector' : ''}`}>
-          <div className="content-viewport">
+          <div className="content-viewport" ref={viewportRef}>
             <div style={{ display: activeNav === 'import' ? undefined : 'none' }}>
               <ImportView />
             </div>

@@ -630,15 +630,18 @@ pub fn eject_volume(mount_path: &Path) -> Result<()> {
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
         use windows::core::PCWSTR;
         use windows::Win32::Devices::DeviceAndDriverInstallation::{
-            CM_Get_Parent, CM_Request_Device_EjectW, PNP_VetoTypeUnknown,
-            SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
-            SetupDiGetDeviceInterfaceDetailW, CR_SUCCESS, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
-            HDEVINFO, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
+            CM_Get_DevNode_Registry_PropertyW, CM_Get_Parent, CM_Request_Device_EjectW,
+            PNP_VetoOutstandingOpen, PNP_VetoTypeUnknown, PNP_VetoWindowsApp,
+            PNP_VetoWindowsService, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces,
+            SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW, CM_DEVCAP_REMOVABLE,
+            CM_DRP_CAPABILITIES, CR_SUCCESS, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO,
+            SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
         };
         use windows::Win32::Foundation::{CloseHandle, HANDLE};
         use windows::Win32::Storage::FileSystem::{
-            BusType1394, BusTypeMmc, BusTypeSd, BusTypeUsb, CreateFileW, GetDriveTypeW,
-            FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            BusType1394, BusTypeMmc, BusTypeNvme, BusTypeSd, BusTypeUsb, CreateFileW,
+            GetDriveTypeW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING,
         };
         use windows::Win32::System::Ioctl::{
             PropertyStandardQuery, StorageDeviceProperty, GUID_DEVINTERFACE_DISK,
@@ -708,9 +711,11 @@ pub fn eject_volume(mount_path: &Path) -> Result<()> {
             .map_err(|e| anyhow!("Could not open volume {drive} for safe eject: {e}"))?;
             let _h_guard = HandleGuard(handle);
 
-            // Verify the underlying bus is removable or external (USB / SD / MMC / 1394)
-            // so we allow USB CFexpress/SSD readers (`DRIVE_FIXED`) while blocking internal SATA/NVMe drives.
+            // Verify the underlying bus is removable or external (USB / SD / MMC / 1394, or
+            // Thunderbolt/USB4 external NVMe verified later via CM_DEVCAP_REMOVABLE) while
+            // reading fields via raw pointers to avoid UB if a driver writes a non-0/1 BOOLEAN.
             let mut is_external_bus = drive_type == DRIVE_REMOVABLE;
+            let mut is_nvme_bus = false;
             let query = STORAGE_PROPERTY_QUERY {
                 PropertyId: StorageDeviceProperty,
                 QueryType: PropertyStandardQuery,
@@ -733,14 +738,24 @@ pub fn eject_volume(mount_path: &Path) -> Result<()> {
             .is_ok()
                 && (desc_bytes as usize) >= std::mem::size_of::<STORAGE_DEVICE_DESCRIPTOR>()
             {
-                let desc = unsafe { &*(desc_buf.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>()) };
-                if desc.RemovableMedia
-                    || [BusTypeUsb, BusTypeSd, BusTypeMmc, BusType1394].contains(&desc.BusType)
+                let desc_ptr = desc_buf.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>();
+                let removable_media = unsafe {
+                    std::ptr::addr_of!((*desc_ptr).RemovableMedia)
+                        .cast::<u8>()
+                        .read_unaligned()
+                        != 0
+                };
+                let bus_type = unsafe { std::ptr::addr_of!((*desc_ptr).BusType).read_unaligned() };
+                if bus_type == BusTypeNvme {
+                    is_nvme_bus = true;
+                }
+                if removable_media
+                    || [BusTypeUsb, BusTypeSd, BusTypeMmc, BusType1394].contains(&bus_type)
                 {
                     is_external_bus = true;
                 }
             }
-            if !is_external_bus {
+            if !is_external_bus && !is_nvme_bus {
                 return Err(anyhow!(
                     "Refusing to eject internal fixed Windows volume {drive}."
                 ));
@@ -889,49 +904,240 @@ pub fn eject_volume(mount_path: &Path) -> Result<()> {
         let dev_inst = matched_devinst
             .ok_or_else(|| anyhow!("Could not locate removable device node for {drive}."))?;
 
-        let try_pnp_eject = |node: u32| -> Result<(), String> {
-            let mut veto_type = PNP_VetoTypeUnknown;
-            let mut veto_buf = [0u16; 256];
+        let is_node_removable = |node: u32| -> bool {
+            let mut caps: u32 = 0;
+            let mut len = std::mem::size_of::<u32>() as u32;
             let cr = unsafe {
-                CM_Request_Device_EjectW(node, Some(&mut veto_type), Some(&mut veto_buf), 0)
+                CM_Get_DevNode_Registry_PropertyW(
+                    node,
+                    CM_DRP_CAPABILITIES,
+                    None,
+                    Some((&mut caps as *mut u32).cast()),
+                    &mut len,
+                    0,
+                )
             };
-            if cr == CR_SUCCESS && veto_type == PNP_VetoTypeUnknown {
-                return Ok(());
+            cr == CR_SUCCESS && (caps & CM_DEVCAP_REMOVABLE.0) != 0
+        };
+
+        // Walk up from `dev_inst` to find the nearest PnP-removable node (`CM_DEVCAP_REMOVABLE`):
+        // - Built-in laptop SD readers & multi-slot card readers mark the disk/LUN itself removable
+        //   so we eject ONLY that slot and never disable the built-in reader or sibling slots.
+        // - Single-slot USB readers & composite USB-C docks (`MI_00`) walk up to the removable
+        //   parent/grandparent USB device.
+        // - External Thunderbolt/USB4 NVMe enclosures have `CM_DEVCAP_REMOVABLE`; internal NVMe
+        //   drives do not and are refused.
+        let mut target_node: Option<u32> = None;
+        let mut cur = dev_inst;
+        for _ in 0..4 {
+            if is_node_removable(cur) {
+                target_node = Some(cur);
+                break;
             }
-            let end = veto_buf
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(veto_buf.len());
-            let veto_name = OsString::from_wide(&veto_buf[..end])
-                .to_string_lossy()
-                .trim()
-                .to_string();
-            if veto_name.is_empty() {
-                Err(format!(
-                    "PnP eject returned code {} (veto {})",
-                    cr.0, veto_type.0
-                ))
-            } else {
-                Err(format!("in use by {veto_name}"))
+            let mut parent = 0u32;
+            if unsafe { CM_Get_Parent(&mut parent, cur, 0) } != CR_SUCCESS || parent == 0 {
+                break;
+            }
+            cur = parent;
+        }
+
+        let eject_node = match target_node {
+            Some(node) => node,
+            None => {
+                return Err(anyhow!(
+                    "Refusing to eject non-removable Windows volume {drive}."
+                ));
             }
         };
 
-        // On USB readers/SSDs the ejectable PnP node is the parent USB Mass Storage device;
-        // on built-in SD controllers it can be the disk node itself. Try parent first, then disk.
-        let mut parent_inst = 0u32;
-        if unsafe { CM_Get_Parent(&mut parent_inst, dev_inst, 0) } == CR_SUCCESS
-            && try_pnp_eject(parent_inst).is_ok()
-        {
+        let mut veto_type = PNP_VetoTypeUnknown;
+        let mut veto_buf = [0u16; 256];
+        let cr = unsafe {
+            CM_Request_Device_EjectW(eject_node, Some(&mut veto_type), Some(&mut veto_buf), 0)
+        };
+        if cr == CR_SUCCESS && veto_type == PNP_VetoTypeUnknown {
             return Ok(());
         }
-        try_pnp_eject(dev_inst)
-            .map_err(|reason| anyhow!("Could not safely eject {drive}: {reason}"))
+        let end = veto_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(veto_buf.len());
+        let veto_name = OsString::from_wide(&veto_buf[..end])
+            .to_string_lossy()
+            .trim()
+            .to_string();
+        let is_open_handle_veto = [
+            PNP_VetoWindowsApp,
+            PNP_VetoWindowsService,
+            PNP_VetoOutstandingOpen,
+        ]
+        .contains(&veto_type);
+        let reason = if is_open_handle_veto && !veto_name.is_empty() {
+            format!("in use by {veto_name}")
+        } else if !veto_name.is_empty() {
+            format!("device veto {} ({veto_name})", veto_type.0)
+        } else {
+            format!("PnP eject returned code {} (veto {})", cr.0, veto_type.0)
+        };
+        Err(anyhow!("Could not safely eject {drive}: {reason}"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = mount_path;
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_parent_whole_disk(path: &Path) -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/diskutil")
+        .args(["info", "-plist"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let plist::Value::Dictionary(dict) = plist::from_bytes(&out.stdout).ok()? else {
+        return None;
+    };
+    dict.get("ParentWholeDisk")
+        .and_then(|v| v.as_string())
+        .map(str::to_string)
+}
+
+/// Returns `true` if `source_root` and `dest_root` reside on the same filesystem volume OR
+/// on two partitions of the same physical external disk (so auto-eject never unmounts `dest_root`).
+pub fn same_physical_disk_or_volume(source_root: &Path, dest_root: &Path) -> bool {
+    let src_anc = existing_ancestor(source_root).unwrap_or_else(|_| source_root.to_path_buf());
+    let dst_anc = existing_ancestor(dest_root).unwrap_or_else(|_| dest_root.to_path_buf());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(sm), Ok(dm)) = (std::fs::metadata(&src_anc), std::fs::metadata(&dst_anc)) {
+            if sm.dev() == dm.dev() {
+                return true;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let cs = std::fs::canonicalize(&src_anc).unwrap_or(src_anc);
+                let cd = std::fs::canonicalize(&dst_anc).unwrap_or(dst_anc);
+                if cs.starts_with("/Volumes/") && cd.starts_with("/Volumes/") {
+                    if let (Some(ds), Some(dd)) =
+                        (macos_parent_whole_disk(&cs), macos_parent_whole_disk(&cd))
+                    {
+                        if ds == dd {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+            FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows::Win32::System::Ioctl::{
+            IOCTL_STORAGE_GET_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER,
+        };
+        use windows::Win32::System::IO::DeviceIoControl;
+
+        let vol_guid = |p: &Path| -> Option<String> {
+            let wide: Vec<u16> = p
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let mut mp_buf = vec![0u16; 512];
+            unsafe { GetVolumePathNameW(PCWSTR(wide.as_ptr()), &mut mp_buf) }.ok()?;
+            let mut guid_buf = [0u16; 128];
+            if unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(mp_buf.as_ptr()), &mut guid_buf) }
+                .is_ok()
+            {
+                let end = guid_buf
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(guid_buf.len());
+                return Some(
+                    OsString::from_wide(&guid_buf[..end])
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+            let end = mp_buf.iter().position(|&c| c == 0).unwrap_or(mp_buf.len());
+            Some(
+                OsString::from_wide(&mp_buf[..end])
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        };
+        let disk_number = |guid_or_root: &str| -> Option<(u32, u32)> {
+            let trimmed = guid_or_root.trim_end_matches('\\');
+            let dev_path = if trimmed.starts_with(r"\\?\") {
+                trimmed.to_string()
+            } else {
+                format!(r"\\.\{trimmed}")
+            };
+            let wide: Vec<u16> = std::ffi::OsStr::new(&dev_path)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let h = unsafe {
+                CreateFileW(
+                    PCWSTR(wide.as_ptr()),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAGS_AND_ATTRIBUTES(0),
+                    None,
+                )
+            }
+            .ok()?;
+            let mut sdn = STORAGE_DEVICE_NUMBER {
+                DeviceType: 0,
+                DeviceNumber: 0,
+                PartitionNumber: 0,
+            };
+            let mut ret = 0u32;
+            let ok = unsafe {
+                DeviceIoControl(
+                    h,
+                    IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                    None,
+                    0,
+                    Some((&mut sdn as *mut STORAGE_DEVICE_NUMBER).cast()),
+                    std::mem::size_of::<STORAGE_DEVICE_NUMBER>() as u32,
+                    Some(&mut ret),
+                    None,
+                )
+            }
+            .is_ok();
+            let _ = unsafe { CloseHandle(h) };
+            ok.then_some((sdn.DeviceType, sdn.DeviceNumber))
+        };
+
+        if let (Some(sv), Some(dv)) = (vol_guid(&src_anc), vol_guid(&dst_anc)) {
+            if sv.eq_ignore_ascii_case(&dv) {
+                return true;
+            }
+            if let (Some(ds), Some(dd)) = (disk_number(&sv), disk_number(&dv)) {
+                if ds == dd {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    src_anc == dst_anc || dst_anc.starts_with(&src_anc) || src_anc.starts_with(&dst_anc)
 }
 
 #[cfg(test)]

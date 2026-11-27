@@ -495,10 +495,14 @@ pub(crate) fn join_rel_path(base: &Path, rel: &str) -> PathBuf {
         if seg.is_empty() || seg == "." || seg == ".." {
             continue;
         }
-        // Reject Windows drive-prefix segments (`C:`, `D:`) which would replace `out` in `PathBuf::push`
-        let b = seg.as_bytes();
-        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
-            continue;
+        // Only reject Windows drive-prefix segments (`C:`, `D:`) on Windows; on macOS,
+        // Finder legitimately encodes `/` in folder names like `B/W` as `B:W` on POSIX APFS.
+        #[cfg(windows)]
+        {
+            let b = seg.as_bytes();
+            if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                continue;
+            }
         }
         if matches!(
             Path::new(seg).components().next(),

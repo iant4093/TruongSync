@@ -330,6 +330,9 @@ pub fn relative_normalized(root: &Path, full_path: &Path) -> Option<String> {
         if r_trim.is_empty() {
             return None;
         }
+        if f.eq_ignore_ascii_case(&r_trim) {
+            return Some(String::new());
+        }
         // Check ASCII '/' boundary FIRST so slicing at `r_trim.len()` is guaranteed UTF-8 safe!
         if f.len() > r_trim.len()
             && f.as_bytes().get(r_trim.len()) == Some(&b'/')
